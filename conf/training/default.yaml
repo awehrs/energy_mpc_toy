@@ -1,0 +1,73 @@
+seed: 42
+learning_rate: 1e-5
+lr_scheduler_type: constant # "linear", "cosine", "constant"
+logging_strategy: steps
+logging_steps: 10
+logging_nan_inf_filter: false
+save_strategy: steps
+save_steps: 500
+save_total_limit: 3
+eval_strategy: "no"
+eval_steps: 500
+eval_accumulation_steps: 
+log_dir: base
+log_wandb: true
+output_dir: "data/out"
+wandb_project: "training"
+wandb_entity: awehrs
+wandb_run: 
+wandb_run_name: 
+max_steps: -1
+num_epochs: 3
+warmup_steps: 500
+gradient_checkpointing: false
+gradient_accumulation_steps: 1
+per_device_train_batch_size: 2
+per_device_eval_batch_size: 4
+weight_decay: 0.0
+adam_beta1: 0.9
+adam_beta2: 0.95
+adam_epsilon: 1e-8
+max_grad_norm: 1.0 
+mixed_precision: bf16 # "none", "fp16", "bf16"
+dtype: bf16
+half_precision_backend: auto
+verbose: false
+backend: nccl
+device: cuda
+jit_mode_eval: false 
+torch_compile: false
+torch_compile_mode:
+quantization:
+fuse_gelu:
+deepspeed:
+init_retriever: true
+disable_tqdm: false
+resume_from_checkpoint: false
+print_dataset_stats: true 
+torch_empty_cache_steps: 100
+dataloader_drop_last: true
+prediction_loss_only: true
+dataloader_num_workers: 0
+dataloader_pin_memory: true
+
+# Main loss weights 
+decode_loss_weight: 1.0
+energy_loss_weight: 1.0  # Energy learns to track decode improvements
+forward_loss_weight: 0.1  # Reduce forward model pressure
+
+# EMA target encoder settings
+ema_momentum: 0.8  # Faster target evolution
+
+
+
+
+
+    
+
+  
+  
+
+
+  
+

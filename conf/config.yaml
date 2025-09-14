@@ -1,0 +1,22 @@
+# Main configuration file with defaults
+defaults:
+  - model: default
+  - dataset:
+  - training: default
+  - _self_ 
+
+
+# Shared parameters
+max_target_length: 1024
+
+# Model architecture parameters 
+dropout: 0.1
+pretrained_lm: gpt2
+n_self_attn_heads: 8
+n_cross_attn_heads: 8
+
+# Data parameters
+n_docs: 8
+max_steps: 8
+index_dim: 64
+    

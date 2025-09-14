@@ -1,0 +1,28 @@
+# Inherited architecture configuration
+n_docs: ${n_docs}
+dropout: ${dropout}
+max_steps: ${max_steps}
+index_dim: ${index_dim}
+pretrained_lm: ${pretrained_lm}
+max_target_length: ${max_target_length}
+n_self_attn_heads: ${n_self_attn_heads}
+n_cross_attn_heads: ${n_cross_attn_heads}
+
+# Model wide params.
+d_model: 768
+
+# Encoder params.
+n_encoder_layers: 4
+n_bottleneck_tokens: 32
+
+# Forward model params.
+n_forward_layers: 8
+n_action_tokens: 8
+
+# Decoder params.
+adapter_dim: 768
+num_prefix_tokens: 8
+
+# Energy params. 
+d_energy_model: 768
+

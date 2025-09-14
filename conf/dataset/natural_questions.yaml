@@ -1,0 +1,7 @@
+split: validation  # Use smaller validation split (~7.8k vs ~307k examples)
+foveate_ratio: 0.8
+n_steps: 10
+chunk_size: 1024
+model_name: ${pretrained_lm}
+max_query_length: ${max_query_length}
+max_target_length: ${max_target_length}
