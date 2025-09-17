@@ -124,7 +124,7 @@ class CrossAttentionAdapter(nn.Module):
 
 class Decoder(nn.Module):
     """
-    Wrapper around pretrained decoder with adapter for custom latents.
+    Wrapper around pretrained decoder with adapter for prefix-tuned custom latents.
     """
 
     def __init__(

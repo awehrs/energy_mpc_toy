@@ -1,0 +1,29 @@
+# Hotp"sentence-transformers/all-MiniLM-L6-v2"  otQA dataset configuration
+_target_: retrieval.dataset.create_controlled_dataset
+
+debug: false
+
+# Data paths
+chunks_file: "data/processed/hotpotqa_train/chunks.pt"
+examples_file: "data/processed/hotpotqa_train/examples.json"
+index_dir: "data/indexes/hotpotqa_train"
+index_name: "chunk_index"
+
+# Retrieval parameters
+n_docs: ${n_docs_default} 
+max_steps: ${max_steps_default} 
+random_seed: 42
+
+# Preprocessing parameters (for building index)
+preprocessing:
+  model_name: ${pretrained_lm} 
+  chunk_size: 256
+  overlap_size: 32
+  min_chunk_length: 64
+  
+# Index building parameters
+index_building:
+  model_name: ${index_model}
+  index_type: "flat"  # "flat", "ivf", "hnsw"
+  batch_size: 32
+  device: "auto"  # "auto", "cuda", "cpu"

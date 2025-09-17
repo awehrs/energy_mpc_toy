@@ -26,8 +26,7 @@ class ForwardModel(nn.Module):
         n_heads: int = 16,
         n_layers: int = 4,
         dropout: float = 0.1,
-        n_docs_per_step: int = 4,
-        compressed_doc_len: int = 16,
+        n_bottleneck_tokens: int = 16,
         n_action_tokens_per_step: int = 1,
         max_steps: int = 8,
     ):
@@ -36,10 +35,11 @@ class ForwardModel(nn.Module):
         self.n_heads = n_heads
         self.n_layers = n_layers
 
-        self.D = n_docs_per_step * compressed_doc_len
+        self.D = n_bottleneck_tokens
         self.A = n_action_tokens_per_step
         self.S = self.D + self.A
         self.max_steps = max_steps
+        print(f"ForwardModel: D={self.D}, A={self.A}, S={self.S}, max_steps={max_steps}, expected_seq_len={max_steps * self.S}")
 
         self.flex_attention_enabled = False
         self.block_mask_full = None
@@ -164,20 +164,27 @@ class ForwardModel(nn.Module):
 
     def forward(
         self,
-        doc_latents: torch.Tensor,  # [B, N*D, d_model]
-        action_latents: torch.Tensor,  # [B, N*A, d_model]
+        doc_latents: torch.Tensor,  # [B, steps+1, D, d_model] (includes question step)
+        action_latents: torch.Tensor,  # [B, steps, A, d_model] (no action for question)
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         Args:
-            doc_latents: [batch, n_retrieval_steps, n_docs_per_step * n_doc_latents_per_step, d_model]
-            action_latents: [batch, n_retrieval_steps, n_action_tokens_per_step, d_model]
+            doc_latents: [batch, steps+1, n_docs_per_step * n_doc_latents_per_step, d_model] (includes question)
+            action_latents: [batch, steps, n_action_tokens_per_step, d_model] (retrieval steps only)
         Returns:
-            docs_out: [batch, n_retrieval_steps, n_latent_doc_tokens_per_step, d_model]
-            acts_out: [batch, n_retrieval_steps, n_action_tokens_per_step, d_model]
+            docs_out: [batch, steps+1, n_latent_doc_tokens_per_step, d_model] (includes question)
+            acts_out: [batch, steps+1, n_action_tokens_per_step, d_model] (padded with zeros for question)
 
         """
-        latent = torch.cat([doc_latents, action_latents], dim=2)  # [B, N, D+A, d_model]
+        batch_size, steps_plus_one, doc_tokens, d_model = doc_latents.shape
+
+        print(f"ForwardModel forward: doc_latents.shape={doc_latents.shape}, action_latents.shape={action_latents.shape}")
+
+        # Both inputs should already have the same number of steps (steps+1)
+        latent = torch.cat([doc_latents, action_latents], dim=2)  # [B, steps+1, D+A, d_model]
         latent = einops.rearrange(latent, "b n t h -> b (n t) h")
+
+        print(f"ForwardModel forward: latent.shape={latent.shape}, expected S={self.S}, expected max_seq_len={self.max_steps * self.S}")
 
         for layer in self.temporal_transformer:
             if self.flex_attention_enabled:

@@ -1,0 +1,29 @@
+# HotpotQA debug dataset configuration (small subset for testing)
+_target_: retrieval.dataset.create_controlled_dataset
+
+debug: true
+
+# Data paths (debug versions)
+chunks_file: "data/processed/hotpotqa_train_debug/chunks.pt"
+examples_file: "data/processed/hotpotqa_train_debug/examples.json"
+index_dir: "data/indexes/hotpotqa_train_debug"
+index_name: "chunk_index"
+
+# Retrieval parameters (smaller for debugging)
+n_docs: ${n_docs_debug}  
+max_steps: ${n_docs_debug}
+random_seed: 42
+
+# Preprocessing parameters (for building index)
+preprocessing:
+  model_name: ${pretrained_lm}  # For tokenization during chunking
+  chunk_size: 256
+  overlap_size: 32
+  min_chunk_length: 64
+  
+# Index building parameters
+index_building:
+  model_name: "sentence-transformers/all-MiniLM-L6-v2"  
+  index_type: "flat"  # Use flat for small debug dataset
+  batch_size: 16  # Smaller batch size
+  device: "auto"  # "auto", "cuda", "cpu"

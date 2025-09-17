@@ -1,13 +1,14 @@
 # Main configuration file with defaults
 defaults:
   - model: default
-  - dataset:
+  - dataset: hotpotqa
   - training: default
   - _self_ 
 
-
 # Shared parameters
 max_target_length: 1024
+index_model: "sentence-transformers/all-MiniLM-L6-v2"  
+index_dim: 384
 
 # Model architecture parameters 
 dropout: 0.1
@@ -16,7 +17,11 @@ n_self_attn_heads: 8
 n_cross_attn_heads: 8
 
 # Data parameters
-n_docs: 8
-max_steps: 8
-index_dim: 64
+n_docs_default: 8 # Number of documents per retrieval step
+max_steps_default: 8 # Maximum number of retrieval steps
+
+n_docs_debug: 4 
+max_steps_debug: 4
+
+
     

@@ -58,6 +58,7 @@ class Encoder(nn.Module):
     def forward(
         self,
         input_ids: torch.Tensor,
+        attention_mask: torch.Tensor = None,
     ) -> torch.Tensor:
         """
         Pretrained encoder pre-processing -> Cross-attention compression -> Self-attention post-processing.
@@ -77,7 +78,7 @@ class Encoder(nn.Module):
         )  # [batch, n_bottleneck_tokens, d_model]
 
         # run through pretrained LLM
-        outputs = self.pretrained_llm(input_ids, return_dict=True, output_hidden_states=True)
+        outputs = self.pretrained_llm(input_ids, attention_mask=attention_mask, return_dict=True, output_hidden_states=True)
         # Handle both CausalLM and base transformer outputs
         if hasattr(outputs, 'last_hidden_state'):
             preprocessed_inputs = outputs.last_hidden_state  # [batch, t, hidden_size]

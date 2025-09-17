@@ -1,73 +1,124 @@
+# ================================
+# Energy MPC Training Default Config
+# ================================
+# Production training configuration with optimized settings
+
+# Basic Training Parameters
+name: default
 seed: 42
-learning_rate: 1e-5
-lr_scheduler_type: constant # "linear", "cosine", "constant"
-logging_strategy: steps
-logging_steps: 10
-logging_nan_inf_filter: false
-save_strategy: steps
-save_steps: 500
-save_total_limit: 3
-eval_strategy: "no"
-eval_steps: 500
-eval_accumulation_steps: 
-log_dir: base
-log_wandb: true
-output_dir: "data/out"
-wandb_project: "training"
-wandb_entity: awehrs
-wandb_run: 
-wandb_run_name: 
-max_steps: -1
 num_epochs: 3
+max_steps: -1  # Train for full epochs
+per_device_train_batch_size: 16
+per_device_eval_batch_size: 16
+gradient_accumulation_steps: 5
+
+# Learning Rate & Optimization
+learning_rate: 1e-5
+lr_scheduler_type: "constant"  # "linear", "cosine", "constant"
 warmup_steps: 500
-gradient_checkpointing: false
-gradient_accumulation_steps: 1
-per_device_train_batch_size: 2
-per_device_eval_batch_size: 4
-weight_decay: 0.0
 adam_beta1: 0.9
 adam_beta2: 0.95
 adam_epsilon: 1e-8
-max_grad_norm: 1.0 
-mixed_precision: bf16 # "none", "fp16", "bf16"
+weight_decay: 0.0
+max_grad_norm: 1.0
+
+# Mixed Precision & Compilation
+mixed_precision: "bf16"  # "none", "fp16", "bf16"
 dtype: bf16
 half_precision_backend: auto
+torch_compile: false
+torch_compile_mode: null
+gradient_checkpointing: false
+
+# Logging & Evaluation
+logging_strategy: steps
+logging_steps: 10
+logging_nan_inf_filter: false
+eval_strategy: "no"
+eval_steps: 500
+eval_accumulation_steps: null
+save_strategy: steps
+save_steps: 2000  # Less frequent checkpointing to reduce bloat warnings
+save_total_limit: 3
+
+# Output & Checkpointing
+output_dir: "data/out"
+resume_from_checkpoint: false
+
+# Wandb Configuration
+log_wandb: true
+wandb_project: "training"
+wandb_entity: awehrs
+wandb_run: null
+wandb_run_name: null
+
+# ================================
+# Energy MPC Specific Parameters
+# ================================
+
+# Sequence Plot Logging
+plot_logging_frequency: 100  # Plot CE vs Energy less frequently
+
+# Loss Component Weights
+w_decode: 1.0      # Decoding loss weight
+w_energy: 1.0      # Energy supervision weight
+w_mono: 0.2        # Monotonicity penalty weight
+w_forward: 0.1     # Forward prediction loss weight
+mono_margin: 0.0   # Monotonicity margin
+
+
+# ================================
+# Dataloader & System Settings
+# ================================
+
+# Dataloader
+dataloader_num_workers: 0
+dataloader_pin_memory: true
+dataloader_drop_last: true
+
+# System Settings
+log_dir: base
 verbose: false
 backend: nccl
 device: cuda
-jit_mode_eval: false 
-torch_compile: false
-torch_compile_mode:
-quantization:
-fuse_gelu:
-deepspeed:
+jit_mode_eval: false
+quantization: null
+fuse_gelu: null
+deepspeed: null
 init_retriever: true
 disable_tqdm: false
-resume_from_checkpoint: false
-print_dataset_stats: true 
+print_dataset_stats: true
 torch_empty_cache_steps: 100
-dataloader_drop_last: true
 prediction_loss_only: true
-dataloader_num_workers: 0
-dataloader_pin_memory: true
 
-# Main loss weights 
-decode_loss_weight: 1.0
-energy_loss_weight: 1.0  # Energy learns to track decode improvements
-forward_loss_weight: 0.1  # Reduce forward model pressure
+# ================================
+# Dataset Building Configuration
+# ================================
 
-# EMA target encoder settings
-ema_momentum: 0.8  # Faster target evolution
+# Dataset building happens automatically based on file detection
 
+# Raw data and preprocessing
+raw_data_path: "data/hotpotqa/hotpot_train_v1.1.json"
+preprocessing:
+  model_name: "gpt2"
+  chunk_size: 256
+  overlap_size: 32
 
+# Index building
+index_building:
+  model_name: "sentence-transformers/all-MiniLM-L6-v2"
+  index_type: "flat"
+  batch_size: 32
+  device: "cuda"
 
+# Dataset Paths (generated automatically if build_dataset=true)
+chunks_file: null
+examples_file: null
+index_dir: null
+index_name: null
 
-
-    
-
-  
-  
-
-
-  
-
+# Optional Evaluation Dataset
+eval_chunks_file: null
+eval_examples_file: null
+eval_index_dir: null
+eval_index_name: null

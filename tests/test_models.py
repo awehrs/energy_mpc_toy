@@ -11,7 +11,6 @@ from models.encoder import Encoder
 from models.energy_model import EnergyModel
 from models.forward_model import ForwardModel
 from models.model import Model
-from models.query_embedder import QueryEmbedder
 
 
 @pytest.mark.parametrize("batch_size,latent_len,latent_dim", [(2, 10, 256)])
@@ -102,16 +101,14 @@ def test_encoder_with_gpt2(batch_size, seq_len):
 def test_forward_model_forward_pass(batch_size, n_steps):
     # Test config
     d_model = 32
-    n_docs_per_step = 2
-    compressed_doc_len = 4
+    n_bottleneck_tokens = 8  # n_docs_per_step * compressed_doc_len = 2 * 4
     n_action_tokens_per_step = 1
 
     model = ForwardModel(
         d_model=d_model,
         n_heads=4,
         n_layers=2,
-        n_docs_per_step=n_docs_per_step,
-        compressed_doc_len=compressed_doc_len,
+        n_bottleneck_tokens=n_bottleneck_tokens,
         n_action_tokens_per_step=n_action_tokens_per_step,
         max_steps=n_steps,
     )
@@ -120,7 +117,7 @@ def test_forward_model_forward_pass(batch_size, n_steps):
     doc_latents = torch.randn(
         batch_size,
         n_steps,
-        n_docs_per_step * compressed_doc_len,
+        n_bottleneck_tokens,
         d_model,
         requires_grad=True,
     )
@@ -135,7 +132,7 @@ def test_forward_model_forward_pass(batch_size, n_steps):
     expected_doc_shape = (
         batch_size,
         n_steps,
-        n_docs_per_step * compressed_doc_len,
+        n_bottleneck_tokens,
         d_model,
     )
     expected_act_shape = (batch_size, n_steps, n_action_tokens_per_step, d_model)
@@ -171,12 +168,10 @@ def test_forward_model_mask_rules_cpu():
         d_model=16,
         n_heads=2,
         n_layers=1,
-        n_docs_per_step=1,
-        compressed_doc_len=D,
+        n_bottleneck_tokens=D,  # Use D as n_bottleneck_tokens
         n_action_tokens_per_step=A,
+        max_steps=max_steps,
     )
-    model.max_steps = max_steps
-    model._setup_flex_attention()  # rebuild mask
 
     block_mask = model.block_mask_full
     Q_LEN = KV_LEN = max_steps * (D + A)
@@ -252,39 +247,6 @@ def test_energy_model_forward(batch_size, n_latents, d_model):
     ), "Energy should change when latent changes"
 
 
-def test_query_embedder_forward():
-    batch_size = 4
-    n_latents = 10
-    input_dim = 32
-    index_dim = 64
-
-    model = QueryEmbedder(
-        input_dim=input_dim,
-        index_dim=index_dim,
-        d_model=128,
-        n_heads=4,
-    )
-    latent = torch.randn(batch_size, n_latents, input_dim)
-
-    # Forward pass
-    out = model(latent)
-
-    # Shape check
-    assert out.shape == (batch_size, index_dim)
-
-    # Normalization check: each row should have norm ~1
-    norms = out.norm(dim=-1)
-    assert torch.allclose(
-        norms, torch.ones_like(norms), atol=1e-5
-    ), f"Norms not close to 1: {norms}"
-
-    # Gradient check
-    loss = out.sum()
-    loss.backward()
-    for name, param in model.named_parameters():
-        if param.requires_grad:
-            assert param.grad is not None, f"No gradient for {name}"
-
 
 @pytest.mark.parametrize("batch_size,n_latent_action_tokens", [(2, 3), (4, 5)])
 def test_action_projection_forward(batch_size, n_latent_action_tokens):
@@ -350,76 +312,76 @@ def test_action_projection_forward(batch_size, n_latent_action_tokens):
 def test_main_model_forward(batch_size, n_steps):
     # Load debug config with Hydra
     config_dir = os.path.join(os.path.dirname(__file__), "../conf")
-    
+
     with initialize_config_dir(config_dir=os.path.abspath(config_dir), version_base="1.1"):
-        config = compose(config_name="config", overrides=["model=debug", f"max_steps={n_steps}"])
-    
+        config = compose(config_name="config", overrides=["model=debug", f"model.max_steps={n_steps}"])
+
     # Build model
     model = Model(config.model)
-    
-    # Create test inputs matching expected shapes
-    n_docs_per_step = config.n_docs
+
+    # Create test inputs matching dataset output format
+    n_docs_per_step = config.model.n_docs
     doc_len = 20
     n_action_tokens_per_step = config.model.n_action_tokens
     index_dim = config.index_dim
-    
-    # Input shapes: [batch, n_retrieval_steps, n_docs_per_step, doc_len]
-    input_ids = torch.randint(
-        0, 1000,  # Use smaller vocab for testing
-        (batch_size, n_steps, n_docs_per_step, doc_len),
-        requires_grad=False
+
+    # Dataset returns these shapes - match exactly
+    input_ids = torch.randint(0, 1000, (batch_size, n_steps, n_docs_per_step, doc_len))
+    attention_mask = torch.ones(batch_size, n_steps, n_docs_per_step, doc_len, dtype=torch.long)
+    question_input_ids = torch.randint(0, 1000, (batch_size, n_docs_per_step * doc_len))
+    question_attention_mask = torch.ones(batch_size, n_docs_per_step * doc_len, dtype=torch.long)
+    retrieval_queries = torch.randn(batch_size, n_steps + 1, index_dim, requires_grad=True)
+    target_tokens = torch.randint(0, 1000, (batch_size, n_steps + 1, doc_len))  # +1 for question step
+
+    # Forward pass - use exact same call as training code
+    outputs = model(
+        input_ids=input_ids,
+        input_attention_mask=attention_mask,
+        retrieval_queries=retrieval_queries,
+        target_tokens=target_tokens,
+        question_input_ids=question_input_ids,
+        question_attention_mask=question_attention_mask,
     )
-    
-    # Retrieval queries: [batch, n_retrieval_steps, n_action_tokens_per_step, index_dim]
-    retrieval_queries = torch.randn(
-        batch_size, n_steps, n_action_tokens_per_step, index_dim,
-        requires_grad=True
-    )
-    
-    # Target tokens for teacher forcing: [batch, n_steps, target_seq_len]
-    target_seq_len = 10
-    target_tokens = torch.randint(
-        0, 1000,  # Use smaller vocab for testing
-        (batch_size, n_steps, target_seq_len),
-        requires_grad=False
-    )
-    
-    # Forward pass
-    outputs = model(input_ids, retrieval_queries, target_tokens)
     
     # Shape validation
     assert isinstance(outputs, dict), "Model should return a dictionary"
-    expected_keys = {"document_latents", "action_latents", "decoder_logits", "energies"}
+    expected_keys = {"encoder_doc_latents", "document_latents", "action_latents", "decoder_logits", "energies"}
     assert set(outputs.keys()) == expected_keys, f"Expected keys {expected_keys}, got {set(outputs.keys())}"
     
-    # Check output shapes
-    n_bottleneck_per_step = n_docs_per_step * config.model.n_bottleneck_tokens
+    # Check output shapes based on forward method docstring
+    n_bottleneck_tokens = config.model.n_bottleneck_tokens
     d_model = config.model.d_model
     vocab_size = model.decoder.vocab_size
-    
-    # document_latents: [batch, n_steps, n_latent_tokens_per_step, d_model]
-    expected_doc_shape = (batch_size, n_steps, n_bottleneck_per_step, d_model)
+
+    # encoder_doc_latents: [batch, n_retrieval_steps+1, n_bottleneck_tokens, d_model]
+    expected_encoder_doc_shape = (batch_size, n_steps+1, n_bottleneck_tokens, d_model)
+    assert outputs["encoder_doc_latents"].shape == expected_encoder_doc_shape, \
+        f"encoder_doc_latents shape: got {outputs['encoder_doc_latents'].shape}, expected {expected_encoder_doc_shape}"
+
+    # document_latents: [batch, n_retrieval_steps+1, n_bottleneck_tokens, d_model]
+    expected_doc_shape = (batch_size, n_steps+1, n_bottleneck_tokens, d_model)
     assert outputs["document_latents"].shape == expected_doc_shape, \
         f"document_latents shape: got {outputs['document_latents'].shape}, expected {expected_doc_shape}"
-    
-    # action_latents: [batch, n_steps, n_action_tokens_per_step, d_model]
-    expected_action_shape = (batch_size, n_steps, n_action_tokens_per_step, d_model)
+
+    # action_latents: [batch, n_retrieval_steps+1, n_action_tokens_per_step, d_model]
+    expected_action_shape = (batch_size, n_steps+1, n_action_tokens_per_step, d_model)
     assert outputs["action_latents"].shape == expected_action_shape, \
         f"action_latents shape: got {outputs['action_latents'].shape}, expected {expected_action_shape}"
-    
-    # decoder_logits: [batch, n_steps, target_seq_len, vocab_size]
-    expected_logits_shape = (batch_size, n_steps, target_seq_len, vocab_size)
+
+    # decoder_logits: [batch, n_retrieval_steps+1, target_seq_len, vocab_size]
+    expected_logits_shape = (batch_size, n_steps+1, doc_len, vocab_size)
     assert outputs["decoder_logits"].shape == expected_logits_shape, \
         f"decoder_logits shape: got {outputs['decoder_logits'].shape}, expected {expected_logits_shape}"
-    
-    # energies: [batch, n_steps]
-    expected_energy_shape = (batch_size, n_steps)
+
+    # energies: [batch, n_retrieval_steps+1]
+    expected_energy_shape = (batch_size, n_steps+1)
     assert outputs["energies"].shape == expected_energy_shape, \
         f"energies shape: got {outputs['energies'].shape}, expected {expected_energy_shape}"
     
     # Gradient flow test
     total_loss = (
-        outputs["document_latents"].sum() + 
+        outputs["encoder_doc_latents"].sum() +
+        outputs["document_latents"].sum() +
         outputs["action_latents"].sum() +
         outputs["decoder_logits"].sum() +
         outputs["energies"].sum()

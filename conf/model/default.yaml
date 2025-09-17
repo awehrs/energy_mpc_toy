@@ -1,7 +1,7 @@
 # Inherited architecture configuration
-n_docs: ${n_docs}
+n_docs: ${n_docs_default}
 dropout: ${dropout}
-max_steps: ${max_steps}
+max_steps: ${max_steps_default}
 index_dim: ${index_dim}
 pretrained_lm: ${pretrained_lm}
 max_target_length: ${max_target_length}

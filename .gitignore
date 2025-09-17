@@ -138,10 +138,7 @@ cython_debug/
 .vscode/
 
 # Data files
-data/raw/
-data/processed/
-data/interim/
-data/external/
+data/
 *.csv
 *.json
 *.jsonl
