@@ -1,29 +1,37 @@
-# Hotp"sentence-transformers/all-MiniLM-L6-v2"  otQA dataset configuration
-_target_: retrieval.dataset.create_controlled_dataset
+# HotpotQA dataset configuration
+_target_: retrieval.dataset.create_precomputed_dataset
 
 debug: false
 
 # Data paths
 chunks_file: "data/processed/hotpotqa_train/chunks.pt"
 examples_file: "data/processed/hotpotqa_train/examples.json"
-index_dir: "data/indexes/hotpotqa_train"
-index_name: "chunk_index"
+knn_cache_file: "data/knn_cache/hotpotqa_train/knn_cache.json"
+query_vectors_file: "data/knn_cache/hotpotqa_train/query_vectors.npy"
+example_gold_sets_file: "data/knn_cache/hotpotqa_train/example_gold_sets.json"
 
 # Retrieval parameters
-n_docs: ${n_docs_default} 
-max_steps: ${max_steps_default} 
+n_docs: ${n_docs_default}
+max_steps: ${max_steps_default}
+index_dim: ${index_dim}
 random_seed: 42
 
 # Preprocessing parameters (for building index)
 preprocessing:
-  model_name: ${pretrained_lm} 
+  model_name: ${pretrained_lm}
   chunk_size: 256
   overlap_size: 32
   min_chunk_length: 64
-  
+
 # Index building parameters
 index_building:
   model_name: ${index_model}
   index_type: "flat"  # "flat", "ivf", "hnsw"
   batch_size: 32
   device: "auto"  # "auto", "cuda", "cpu"
+
+# KNN cache building parameters
+cache_building:
+  n_random_queries: 10000
+  k_neighbors: ${n_docs_default}
+  random_seed: 42

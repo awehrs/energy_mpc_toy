@@ -39,7 +39,6 @@ class ForwardModel(nn.Module):
         self.A = n_action_tokens_per_step
         self.S = self.D + self.A
         self.max_steps = max_steps
-        print(f"ForwardModel: D={self.D}, A={self.A}, S={self.S}, max_steps={max_steps}, expected_seq_len={max_steps * self.S}")
 
         self.flex_attention_enabled = False
         self.block_mask_full = None
@@ -178,13 +177,11 @@ class ForwardModel(nn.Module):
         """
         batch_size, steps_plus_one, doc_tokens, d_model = doc_latents.shape
 
-        print(f"ForwardModel forward: doc_latents.shape={doc_latents.shape}, action_latents.shape={action_latents.shape}")
-
         # Both inputs should already have the same number of steps (steps+1)
-        latent = torch.cat([doc_latents, action_latents], dim=2)  # [B, steps+1, D+A, d_model]
+        latent = torch.cat(
+            [doc_latents, action_latents], dim=2
+        )  # [B, steps+1, D+A, d_model]
         latent = einops.rearrange(latent, "b n t h -> b (n t) h")
-
-        print(f"ForwardModel forward: latent.shape={latent.shape}, expected S={self.S}, expected max_seq_len={self.max_steps * self.S}")
 
         for layer in self.temporal_transformer:
             if self.flex_attention_enabled:

@@ -16,7 +16,7 @@ from hydra.core.hydra_config import HydraConfig
 
 from models.model import Model
 from training.trainer import AccelerateTrainer
-from retrieval.dataset import create_controlled_dataset
+from retrieval.dataset import create_precomputed_dataset
 from retrieval.build_dataset import build_dataset_pipeline
 
 logger = logging.getLogger(__name__)
@@ -398,29 +398,54 @@ def main(cfg: DictConfig) -> None:
     logger.info("Starting Energy MPC Training...")
 
     # Check if dataset files exist
-    chunks_file_path = Path("data/processed/hotpotqa_train/chunks.pt")
-    examples_file_path = Path("data/processed/hotpotqa_train/examples.json")
-    index_file_path = Path("data/indexes/hotpotqa_train/chunk_index.faiss")
+    chunks_file_path = Path(cfg.dataset.chunks_file)
+    examples_file_path = Path(cfg.dataset.examples_file)
+    knn_cache_file_path = Path(cfg.dataset.knn_cache_file)
+    query_vectors_file_path = Path(cfg.dataset.query_vectors_file)
+    example_gold_sets_file_path = Path(cfg.dataset.example_gold_sets_file)
 
     if not (
         chunks_file_path.exists()
         and examples_file_path.exists()
-        and index_file_path.exists()
+        and knn_cache_file_path.exists()
+        and query_vectors_file_path.exists()
+        and example_gold_sets_file_path.exists()
     ):
         logger.info("Building dataset pipeline...")
         train_dataset = build_dataset_pipeline(cfg)
         logger.info("Dataset pipeline complete!")
     else:
         logger.info("Loading existing datasets...")
-        train_dataset = create_controlled_dataset(
+        train_dataset = create_precomputed_dataset(
             chunks_file=chunks_file_path,
             examples_file=examples_file_path,
-            index_dir=Path("data/indexes/hotpotqa_train"),
-            index_name="chunk_index",
+            knn_cache_file=Path(cfg.dataset.knn_cache_file),
+            query_vectors_file=Path(cfg.dataset.query_vectors_file),
+            example_gold_sets_file=Path(cfg.dataset.example_gold_sets_file),
             n_docs=cfg.dataset.n_docs,
             max_steps=cfg.dataset.max_steps,
+            index_dim=cfg.dataset.index_dim,
             random_seed=cfg.training.seed,
         )
+
+        # Log gold coverage statistics
+        examples_with_gold = sum(
+            1
+            for gold_queries in train_dataset.example_gold_sets.values()
+            if len(gold_queries) > 0
+        )
+        total_examples = len(train_dataset.example_gold_sets)
+        coverage_percent = (
+            examples_with_gold / total_examples * 100 if total_examples > 0 else 0
+        )
+        logger.info(
+            f"Training dataset gold coverage: {examples_with_gold}/{total_examples} examples ({coverage_percent:.1f}%)"
+        )
+
+        if coverage_percent < 100:
+            logger.warning(
+                f"Only {coverage_percent:.1f}% of examples have gold coverage - consider increasing n_queries in KNN cache"
+            )
 
     # Build model
     logger.info("Building model...")
@@ -429,13 +454,15 @@ def main(cfg: DictConfig) -> None:
     eval_dataset = None
     if hasattr(cfg, "eval_chunks_file") and cfg.eval_chunks_file:
         logger.info("Loading evaluation dataset...")
-        eval_dataset = create_controlled_dataset(
+        eval_dataset = create_precomputed_dataset(
             chunks_file=cfg.eval_chunks_file,
             examples_file=cfg.eval_examples_file,
-            index_dir=cfg.eval_index_dir,
-            index_name=cfg.eval_index_name,
+            knn_cache_file=Path(cfg.eval_knn_cache_file),
+            query_vectors_file=Path(cfg.eval_query_vectors_file),
+            example_gold_sets_file=Path(cfg.eval_example_gold_sets_file),
             n_docs=cfg.model.n_docs,
             max_steps=cfg.model.max_steps,
+            index_dim=cfg.dataset.index_dim,
             random_seed=cfg.seed + 1,  # Different seed for eval
         )
 

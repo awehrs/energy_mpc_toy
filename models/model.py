@@ -6,8 +6,8 @@ import torch
 import torch.nn as nn
 from transformers import AutoConfig, AutoModelForCausalLM
 
-from models.decoder import Decoder
-from models.encoder import Encoder
+from models.actuator import Decoder
+from models.sensor import Encoder
 from models.energy_model import EnergyModel
 from models.forward_model import ForwardModel
 from models.action_projector import ActionProjection
@@ -151,8 +151,12 @@ class Model(nn.Module):
         )  # [b, steps, n_docs*chunk_size]
 
         # Add question as first step
-        question_input_ids = question_input_ids.unsqueeze(1)  # [b, 1, n_docs*chunk_size]
-        question_attention_mask = question_attention_mask.unsqueeze(1)  # [b, 1, n_docs*chunk_size]
+        question_input_ids = question_input_ids.unsqueeze(
+            1
+        )  # [b, 1, n_docs*chunk_size]
+        question_attention_mask = question_attention_mask.unsqueeze(
+            1
+        )  # [b, 1, n_docs*chunk_size]
 
         all_sequences = torch.cat(
             [question_input_ids, docs_flat], dim=1
@@ -265,7 +269,9 @@ class Model(nn.Module):
 
         # Add question as first step
         question_flat = question_flat.unsqueeze(1)  # [b, 1, n_docs*chunk_size]
-        question_attn_flat = question_attn_flat.unsqueeze(1)  # [b, 1, n_docs*chunk_size]
+        question_attn_flat = question_attn_flat.unsqueeze(
+            1
+        )  # [b, 1, n_docs*chunk_size]
 
         all_sequences = torch.cat(
             [question_flat, docs_flat], dim=1

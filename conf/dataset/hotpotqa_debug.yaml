@@ -1,17 +1,20 @@
 # HotpotQA debug dataset configuration (small subset for testing)
-_target_: retrieval.dataset.create_controlled_dataset
+_target_: retrieval.dataset.create_precomputed_dataset
 
 debug: true
 
-# Data paths (debug versions)
-chunks_file: "data/processed/hotpotqa_train_debug/chunks.pt"
-examples_file: "data/processed/hotpotqa_train_debug/examples.json"
-index_dir: "data/indexes/hotpotqa_train_debug"
-index_name: "chunk_index"
+# Data paths (same as production - they won't coexist)
+chunks_file: "data/processed/hotpotqa_train/chunks.pt"
+examples_file: "data/processed/hotpotqa_train/examples.json"
+knn_cache_file: "data/knn_cache/hotpotqa_train/knn_cache.json"
+query_vectors_file: "data/knn_cache/hotpotqa_train/query_vectors.npy"
+example_gold_sets_file: "data/knn_cache/hotpotqa_train/example_gold_sets.json"
 
 # Retrieval parameters (smaller for debugging)
-n_docs: ${n_docs_debug}  
-max_steps: ${n_docs_debug}
+n_docs: ${n_docs_debug}
+max_steps: ${max_steps_debug}
+index_dim: ${index_dim}
+index_name: "chunk_index"
 random_seed: 42
 
 # Preprocessing parameters (for building index)
@@ -20,10 +23,16 @@ preprocessing:
   chunk_size: 256
   overlap_size: 32
   min_chunk_length: 64
-  
+
 # Index building parameters
 index_building:
-  model_name: "sentence-transformers/all-MiniLM-L6-v2"  
+  model_name: ${index_model}
   index_type: "flat"  # Use flat for small debug dataset
   batch_size: 16  # Smaller batch size
   device: "auto"  # "auto", "cuda", "cpu"
+
+# KNN cache building parameters
+knn_cache:
+  n_queries: 10000  # Increased for better coverage
+  k_neighbors: ${n_docs_debug}  # Must equal n_docs to prevent slicing off gold chunks
+  random_seed: 42

@@ -9,9 +9,9 @@ from transformers import AutoTokenizer
 
 from retrieval.download import download_hotpotqa
 from retrieval.index_builder import build_chunk_index
-from retrieval.dataset import create_controlled_dataset
-from retrieval.dataloader import create_flexible_dataloader
+from retrieval.dataset import create_precomputed_dataset
 from retrieval.preprocess import preprocess_hotpotqa_dataset
+from retrieval.build_knn_cache import build_knn_cache
 
 
 @pytest.fixture(scope="module")
@@ -43,7 +43,7 @@ def preprocessed_debug_data(downloaded_debug_data):
             raw_data_path=raw_data_path,
             output_dir=output_dir,
             pretrained_model_name="gpt2",
-            chunk_size=256,  # Updated for sentence windows
+            chunk_size=256,
             overlap_size=32,
         )
 
@@ -75,6 +75,29 @@ def indexed_debug_data(preprocessed_debug_data):
         )
 
         yield chunks_file, examples_file, index_dir
+
+
+@pytest.fixture(scope="module")
+def knn_cache_debug_data(indexed_debug_data):
+    """Fixture to build KNN cache once and reuse across tests."""
+    chunks_file, examples_file, index_dir = indexed_debug_data
+
+    with tempfile.TemporaryDirectory() as temp_dir:
+        cache_dir = Path(temp_dir) / "knn_cache"
+
+        # Build KNN cache with small parameters for testing
+        build_knn_cache(
+            index_file=index_dir / "test_index.faiss",
+            chunk_mapping_file=index_dir / "test_index_chunk_mapping.json",
+            examples_file=examples_file,
+            output_dir=cache_dir,
+            n_random_queries=10000,  # Increased for better gold coverage
+            k_neighbors=3,  # Must equal n_docs used in dataset creation
+            index_dim=384,
+            random_seed=42,
+        )
+
+        yield chunks_file, examples_file, cache_dir
 
 
 def test_download_hotpotqa_debug():
@@ -302,58 +325,175 @@ def test_build_chunk_index(preprocessed_debug_data):
         assert all(0 <= idx < len(chunk_mapping) for idx in indices[0])
 
 
-def test_controlled_dataset_pipeline(indexed_debug_data):
-    """Test the full controlled retrieval dataset pipeline."""
+# def test_controlled_dataset_pipeline(indexed_debug_data):
+#     """Test the full controlled retrieval dataset pipeline."""
 
-    chunks_file, examples_file, index_dir = indexed_debug_data
+#     chunks_file, examples_file, index_dir = indexed_debug_data
 
-    # Create controlled dataset even if no examples have gold chunks
-    # This tests that the dataset can handle edge cases gracefully
-    dataset = create_controlled_dataset(
+#     # Create controlled dataset even if no examples have gold chunks
+#     # This tests that the dataset can handle edge cases gracefully
+#     dataset = create_controlled_dataset(
+#         chunks_file=chunks_file,
+#         examples_file=examples_file,
+#         index_dir=index_dir,
+#         index_name="test_index",
+#         n_docs=3,  # Small for testing
+#         max_steps=2,  # Small for testing
+#         random_seed=42,
+#     )
+
+#     # Check dataset properties
+#     assert hasattr(dataset, "chunks")
+#     assert hasattr(dataset, "examples")
+#     assert hasattr(dataset, "index")
+#     assert hasattr(dataset, "n_docs")
+#     assert hasattr(dataset, "max_steps")
+#     assert hasattr(dataset, "index_dim")
+
+#     assert dataset.n_docs == 3
+#     assert dataset.max_steps == 2
+#     assert dataset.index_dim == 384  # all-MiniLM-L6-v2 dimension
+#     assert len(dataset.chunks) > 0  # Should have chunks
+
+#     # Test dataset length
+#     dataset_len = len(dataset)
+#     print(f"Dataset has {dataset_len} examples")
+
+#     # If we have examples, test the dataset format
+#     if dataset_len > 0:
+#         # Test getting an example
+#         example = dataset[0]
+
+#         # Verify output structure (updated for new dataset)
+#         required_keys = {
+#             "input_ids",
+#             "input_attention_mask",  # Correct key name to distinguish from question_attention_mask
+#             "retrieval_queries",
+#             "target_tokens",
+#             "step_mask",
+#             "question_id",
+#             "question",
+#             "answer",
+#             "question_input_ids",
+#             "question_attention_mask",
+#             "gold_chunk_ids",  # Now included for flexible dataloader
+#         }
+#         assert all(key in example for key in required_keys)
+
+#         # Verify tensor shapes
+#         assert example["input_ids"].shape == (
+#             2,
+#             3,
+#             256,  # Updated chunk_size from 32 to 256
+#         )  # [max_steps, n_docs, chunk_size]
+#         assert example["input_attention_mask"].shape == (
+#             2,
+#             3,
+#             256,  # Updated chunk_size
+#         )  # [max_steps, n_docs, chunk_size]
+#         assert example["retrieval_queries"].shape == (
+#             3,
+#             384,
+#         )  # [max_steps+1, index_dim]
+#         assert example["target_tokens"].shape == (2, 32)  # [max_steps, target_seq_len]
+#         assert example["step_mask"].shape == (2,)  # [max_steps]
+#         assert example["question_input_ids"].shape == (
+#             2048,
+#         )  # [n_docs * chunk_size] = 8 * 256 (preprocessor default)
+#         assert example["question_attention_mask"].shape == (
+#             2048,
+#         )  # [n_docs * chunk_size] = 8 * 256 (preprocessor default)
+
+#         # Verify types
+#         assert isinstance(example["input_ids"], torch.Tensor)
+#         assert isinstance(example["input_attention_mask"], torch.Tensor)
+#         assert isinstance(example["retrieval_queries"], torch.Tensor)
+#         assert isinstance(example["target_tokens"], torch.Tensor)
+#         assert isinstance(example["step_mask"], torch.Tensor)
+#         assert isinstance(example["question_input_ids"], torch.Tensor)
+#         assert isinstance(example["question_attention_mask"], torch.Tensor)
+#         # assert isinstance(example["gold_chunk_ids"], list)  # Not in main dataset
+#         assert isinstance(example["question_id"], str)
+#         assert isinstance(example["question"], str)
+#         assert isinstance(example["answer"], str)
+
+#         # Verify data types
+#         assert example["input_ids"].dtype == torch.long
+#         assert example["input_attention_mask"].dtype == torch.long
+#         assert example["retrieval_queries"].dtype == torch.float32
+#         assert example["target_tokens"].dtype == torch.long
+#         assert example["step_mask"].dtype == torch.bool
+#         assert example["question_input_ids"].dtype == torch.long
+#         assert example["question_attention_mask"].dtype == torch.long
+
+#         # Note: gold_chunk_ids is handled by the flexible dataloader, not the base dataset
+
+#         print(f"Example format verified successfully!")
+#         print(f"  - Question: {example['question'][:50]}...")
+#         print(f"  - Answer: {example['answer'][:50]}...")
+#         print(f"  - Active steps: {example['step_mask'].sum().item()}")
+
+#     else:
+#         print(
+#             "No examples with gold chunks found - this is expected with small debug datasets"
+#         )
+#         print("But chunks and index were created successfully!")
+
+
+def test_precomputed_knn_dataset(knn_cache_debug_data):
+    """Test the precomputed KNN dataset pipeline."""
+
+    chunks_file, examples_file, cache_dir = knn_cache_debug_data
+
+    # Create precomputed dataset
+    dataset = create_precomputed_dataset(
         chunks_file=chunks_file,
         examples_file=examples_file,
-        index_dir=index_dir,
-        index_name="test_index",
+        knn_cache_file=cache_dir / "knn_cache.json",
+        query_vectors_file=cache_dir / "query_vectors.npy",
+        example_gold_sets_file=cache_dir / "example_gold_sets.json",
         n_docs=3,  # Small for testing
         max_steps=2,  # Small for testing
+        index_dim=384,
         random_seed=42,
     )
 
     # Check dataset properties
     assert hasattr(dataset, "chunks")
     assert hasattr(dataset, "examples")
-    assert hasattr(dataset, "index")
+    assert hasattr(dataset, "knn_cache")
+    assert hasattr(dataset, "query_vectors")
+    assert hasattr(dataset, "example_gold_sets")
     assert hasattr(dataset, "n_docs")
     assert hasattr(dataset, "max_steps")
     assert hasattr(dataset, "index_dim")
 
     assert dataset.n_docs == 3
     assert dataset.max_steps == 2
-    assert dataset.index_dim == 384  # all-MiniLM-L6-v2 dimension
+    assert dataset.index_dim == 384
     assert len(dataset.chunks) > 0  # Should have chunks
+    assert len(dataset.knn_cache) == 10000  # We generated 10000 queries
+    assert dataset.query_vectors.shape == (10000, 384)  # [n_queries, index_dim]
 
     # Test dataset length
     dataset_len = len(dataset)
-    print(f"Dataset has {dataset_len} examples")
+    print(f"Precomputed dataset has {dataset_len} examples")
 
     # If we have examples, test the dataset format
     if dataset_len > 0:
         # Test getting an example
         example = dataset[0]
 
-        # Verify output structure (updated for new dataset)
+        # Verify output structure (tensor fields only)
         required_keys = {
             "input_ids",
-            "input_attention_mask",  # Correct key name to distinguish from question_attention_mask
+            "attention_mask",
             "retrieval_queries",
             "target_tokens",
+            "target_attention_mask",
             "step_mask",
-            "question_id",
-            "question",
-            "answer",
             "question_input_ids",
             "question_attention_mask",
-            "gold_chunk_ids",  # Now included for flexible dataloader
         }
         assert all(key in example for key in required_keys)
 
@@ -361,138 +501,245 @@ def test_controlled_dataset_pipeline(indexed_debug_data):
         assert example["input_ids"].shape == (
             2,
             3,
-            256,  # Updated chunk_size from 32 to 256
+            256,
         )  # [max_steps, n_docs, chunk_size]
-        assert example["input_attention_mask"].shape == (
+        assert example["attention_mask"].shape == (
             2,
             3,
-            256,  # Updated chunk_size
+            256,
         )  # [max_steps, n_docs, chunk_size]
         assert example["retrieval_queries"].shape == (
             3,
             384,
         )  # [max_steps+1, index_dim]
-        assert example["target_tokens"].shape == (2, 32)  # [max_steps, target_seq_len]
+        assert example["target_tokens"].shape[0] == 2  # [max_steps, target_seq_len]
         assert example["step_mask"].shape == (2,)  # [max_steps]
-        assert example["question_input_ids"].shape == (2048,)  # [n_docs * chunk_size] = 8 * 256 (preprocessor default)
-        assert example["question_attention_mask"].shape == (
-            2048,
-        )  # [n_docs * chunk_size] = 8 * 256 (preprocessor default)
 
-        # Verify types
+        # Verify types and dtypes
         assert isinstance(example["input_ids"], torch.Tensor)
-        assert isinstance(example["input_attention_mask"], torch.Tensor)
         assert isinstance(example["retrieval_queries"], torch.Tensor)
-        assert isinstance(example["target_tokens"], torch.Tensor)
-        assert isinstance(example["step_mask"], torch.Tensor)
-        assert isinstance(example["question_input_ids"], torch.Tensor)
-        assert isinstance(example["question_attention_mask"], torch.Tensor)
-        # assert isinstance(example["gold_chunk_ids"], list)  # Not in main dataset
-        assert isinstance(example["question_id"], str)
-        assert isinstance(example["question"], str)
-        assert isinstance(example["answer"], str)
-
-        # Verify data types
         assert example["input_ids"].dtype == torch.long
-        assert example["input_attention_mask"].dtype == torch.long
         assert example["retrieval_queries"].dtype == torch.float32
-        assert example["target_tokens"].dtype == torch.long
         assert example["step_mask"].dtype == torch.bool
-        assert example["question_input_ids"].dtype == torch.long
-        assert example["question_attention_mask"].dtype == torch.long
 
-        # Note: gold_chunk_ids is handled by the flexible dataloader, not the base dataset
-
-        print(f"Example format verified successfully!")
-        print(f"  - Question: {example['question'][:50]}...")
-        print(f"  - Answer: {example['answer'][:50]}...")
+        print(f"Precomputed dataset format verified successfully!")
         print(f"  - Active steps: {example['step_mask'].sum().item()}")
 
+        # Test unique gold chunks constraint
+        # Get the original example data to check gold chunks (use index since we don't have question_id)
+        example_data = dataset.examples[0]
+        expected_gold_chunks = set(example_data["gold_chunk_ids"])
+
+        # Check retrieved chunks across all steps for duplicates
+        retrieved_chunks = []
+        for step in range(example["step_mask"].sum().item()):
+            step_input_ids = example["input_ids"][step]  # [n_docs, chunk_size]
+            for doc in range(step_input_ids.shape[0]):
+                # Find which chunk this corresponds to by matching input_ids
+                doc_input_ids = step_input_ids[doc]
+                for chunk in dataset.chunks:
+                    if torch.equal(chunk["input_ids"], doc_input_ids):
+                        retrieved_chunks.append(chunk["chunk_id"])
+                        break
+
+        # Check for gold chunk uniqueness
+        retrieved_gold_chunks = [cid for cid in retrieved_chunks if cid in expected_gold_chunks]
+        unique_retrieved_gold = set(retrieved_gold_chunks)
+        has_duplicates = len(retrieved_gold_chunks) != len(unique_retrieved_gold)
+
+        print(f"  - Expected gold chunks: {len(expected_gold_chunks)}")
+        print(f"  - Retrieved gold chunks: {len(retrieved_gold_chunks)} (unique: {len(unique_retrieved_gold)})")
+        print(f"  - No duplicate gold chunks: {not has_duplicates}")
+
+        assert not has_duplicates, f"Found duplicate gold chunks: {retrieved_gold_chunks}"
+
+        # Test multiple examples to verify randomization
+        if dataset_len > 1:
+            example2 = dataset[1]
+            # Query vectors should be different (randomized step positions)
+            queries_different = not torch.allclose(
+                example["retrieval_queries"][:2], example2["retrieval_queries"][:2]
+            )
+            print(f"  - Query randomization working: {queries_different}")
+
     else:
-        print(
-            "No examples with gold chunks found - this is expected with small debug datasets"
-        )
-        print("But chunks and index were created successfully!")
+        print("No examples found - this shouldn't happen with precomputed cache")
 
 
-def test_flexible_dataloader(indexed_debug_data):
-    """Test the flexible data loader with step permutation and gold insertion."""
+# def test_flexible_dataloader(indexed_debug_data):
+#     """Test the flexible data loader with step permutation and gold insertion."""
 
-    chunks_file, examples_file, index_dir = indexed_debug_data
+#     chunks_file, examples_file, index_dir = indexed_debug_data
 
-    # Create dataset
-    dataset = create_controlled_dataset(
-        chunks_file=chunks_file,
-        examples_file=examples_file,
-        index_dir=index_dir,
-        index_name="test_index",
-        n_docs=3,
-        max_steps=2,
-        random_seed=42,
-    )
+#     # Create dataset
+#     dataset = create_controlled_dataset(
+#         chunks_file=chunks_file,
+#         examples_file=examples_file,
+#         index_dir=index_dir,
+#         index_name="test_index",
+#         n_docs=3,
+#         max_steps=2,
+#         random_seed=42,
+#     )
 
-    # If no examples, create a minimal test case
-    if len(dataset) == 0:
-        print("No examples found - skipping flexible dataloader test")
-        pytest.skip("No examples with gold chunks found")
+#     # If no examples, create a minimal test case
+#     if len(dataset) == 0:
+#         print("No examples found - skipping flexible dataloader test")
+#         pytest.skip("No examples with gold chunks found")
 
-    # Create chunk database for the flexible dataloader
-    chunk_db = {chunk["chunk_id"]: chunk for chunk in dataset.chunks}
+#     # Create chunk database for the flexible dataloader
+#     chunk_db = {chunk["chunk_id"]: chunk for chunk in dataset.chunks}
 
-    # Create flexible dataloader
-    flexible_dataloader = create_flexible_dataloader(
-        dataset=dataset,
-        chunk_db=chunk_db,
-        batch_size=2,
-        shuffle=False,  # Deterministic for testing
-        gold_insertion_prob=1.0,  # Always insert gold for testing
-        max_gold_per_step=1,
-        permute_steps=True,
-    )
+#     # Create flexible dataloader
+#     flexible_dataloader = create_flexible_dataloader(
+#         dataset=dataset,
+#         chunk_db=chunk_db,
+#         batch_size=2,
+#         shuffle=False,  # Deterministic for testing
+#         gold_insertion_prob=1.0,  # Always insert gold for testing
+#         max_gold_per_step=1,
+#         permute_steps=True,
+#     )
 
-    # Test one batch
-    for batch in flexible_dataloader:
-        # Verify batch structure
-        required_keys = {
-            "input_ids",
-            "input_attention_mask",
-            "retrieval_queries",
-            "target_tokens",
-            "question_input_ids",
-            "question_attention_mask",
-            "step_order",
-            "gold_positions",
+#     # Test one batch
+#     for batch in flexible_dataloader:
+#         # Verify batch structure
+#         required_keys = {
+#             "input_ids",
+#             "input_attention_mask",
+#             "retrieval_queries",
+#             "target_tokens",
+#             "question_input_ids",
+#             "question_attention_mask",
+#             "step_order",
+#             "gold_positions",
+#         }
+#         assert all(key in batch for key in required_keys)
+
+#         batch_size = batch["input_ids"].shape[0]
+
+#         # Verify shapes
+#         assert batch["input_ids"].shape == (batch_size, 2, 3, 256)  # Updated chunk_size
+#         assert batch["input_attention_mask"].shape == (
+#             batch_size,
+#             2,
+#             3,
+#             256,
+#         )  # Updated chunk_size
+#         assert batch["retrieval_queries"].shape == (batch_size, 3, 384)
+#         assert batch["question_input_ids"].shape == (batch_size, 2048)  # 8 * 256
+#         assert batch["question_attention_mask"].shape == (batch_size, 2048)  # 8 * 256
+
+#         # Verify metadata
+#         assert len(batch["step_order"]) == batch_size
+#         assert len(batch["gold_positions"]) == batch_size
+
+#         # Verify step orders are permutations
+#         for step_order in batch["step_order"]:
+#             assert sorted(step_order) == [0, 1]  # Should be permutation of [0, 1]
+
+#         # Verify gold positions tracking
+#         for gold_pos in batch["gold_positions"]:
+#             assert len(gold_pos) == 2  # One per step
+#             for step_gold in gold_pos:
+#                 assert isinstance(step_gold, list)
+#                 # Each step should have 0-1 gold positions (max_gold_per_step=1)
+#                 assert len(step_gold) <= 1
+
+#         print(f"Flexible dataloader test passed!")
+#         print(f"  - Batch size: {batch_size}")
+#         print(f"  - Step orders: {batch['step_order']}")
+#         print(f"  - Gold positions: {batch['gold_positions']}")
+
+#         break  # Only test one batch
+
+
+def test_build_dataset_pipeline():
+    """Test the complete dataset building pipeline with KNN cache."""
+    from retrieval.build_dataset import build_dataset_pipeline
+    from omegaconf import DictConfig
+
+    # Create a minimal config for testing
+    cfg = DictConfig({
+        "dataset": {
+            "debug": True,
+            "n_docs": 3,
+            "max_steps": 2,
+            "random_seed": 42,
+            "index_name": "test_index",
+            "preprocessing": {
+                "model_name": "gpt2",
+                "chunk_size": 128,  # Smaller for faster testing
+                "overlap_size": 16
+            },
+            "index_building": {
+                "model_name": "sentence-transformers/all-MiniLM-L6-v2",
+                "index_type": "flat",
+                "batch_size": 8,
+                "device": "cpu"
+            },
+            "knn_cache": {
+                "n_queries": 50,  # Small for testing
+                "k_neighbors": 5
+            }
         }
-        assert all(key in batch for key in required_keys)
+    })
 
-        batch_size = batch["input_ids"].shape[0]
+    with tempfile.TemporaryDirectory() as temp_dir:
+        # Set up temporary data directories
+        original_cwd = Path.cwd()
+        temp_path = Path(temp_dir)
 
-        # Verify shapes
-        assert batch["input_ids"].shape == (batch_size, 2, 3, 256)  # Updated chunk_size
-        assert batch["input_attention_mask"].shape == (batch_size, 2, 3, 256)  # Updated chunk_size
-        assert batch["retrieval_queries"].shape == (batch_size, 3, 384)
-        assert batch["question_input_ids"].shape == (batch_size, 2048)  # 8 * 256
-        assert batch["question_attention_mask"].shape == (batch_size, 2048)  # 8 * 256
+        try:
+            # Change to temp directory to isolate test data
+            import os
+            os.chdir(temp_path)
 
-        # Verify metadata
-        assert len(batch["step_order"]) == batch_size
-        assert len(batch["gold_positions"]) == batch_size
+            # Create data directory structure
+            data_dir = temp_path / "data"
+            data_dir.mkdir()
 
-        # Verify step orders are permutations
-        for step_order in batch["step_order"]:
-            assert sorted(step_order) == [0, 1]  # Should be permutation of [0, 1]
+            # Run the pipeline
+            dataset = build_dataset_pipeline(cfg)
 
-        # Verify gold positions tracking
-        for gold_pos in batch["gold_positions"]:
-            assert len(gold_pos) == 2  # One per step
-            for step_gold in gold_pos:
-                assert isinstance(step_gold, list)
-                # Each step should have 0-1 gold positions (max_gold_per_step=1)
-                assert len(step_gold) <= 1
+            # Verify dataset was created successfully
+            assert dataset is not None
+            assert len(dataset) > 0
+            assert hasattr(dataset, 'n_docs')
+            assert hasattr(dataset, 'max_steps')
+            assert dataset.n_docs == 3
+            assert dataset.max_steps == 2
 
-        print(f"Flexible dataloader test passed!")
-        print(f"  - Batch size: {batch_size}")
-        print(f"  - Step orders: {batch['step_order']}")
-        print(f"  - Gold positions: {batch['gold_positions']}")
+            # Test getting an example
+            example = dataset[0]
 
-        break  # Only test one batch
+            # Verify example structure
+            required_keys = {
+                "input_ids",
+                "input_attention_mask",
+                "retrieval_queries",
+                "target_tokens",
+                "step_mask",
+                "question_id",
+                "question",
+                "answer",
+                "question_input_ids",
+                "question_attention_mask",
+                "gold_chunk_ids"
+            }
+            assert all(key in example for key in required_keys)
+
+            # Verify tensor shapes
+            assert example["input_ids"].shape[0] == 2  # max_steps
+            assert example["input_ids"].shape[1] == 3  # n_docs
+            assert example["retrieval_queries"].shape[0] == 3  # max_steps + 1
+            assert example["retrieval_queries"].shape[1] == 384  # embedding dim
+
+            print(f"Pipeline test successful!")
+            print(f"  - Dataset length: {len(dataset)}")
+            print(f"  - Example question: {example['question'][:50]}...")
+            print(f"  - Active steps: {example['step_mask'].sum().item()}")
+
+        finally:
+            # Restore original working directory
+            os.chdir(original_cwd)
