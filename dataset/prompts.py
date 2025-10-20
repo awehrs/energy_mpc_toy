@@ -1,4 +1,4 @@
-from typing import Dict, List, Union
+from typing import Dict, List, Optional, Union
 
 import numpy as np
 
@@ -333,6 +333,7 @@ class PromptBuilder:
         base_prompt: str = BASE_PROMPT,
         call_prompt: str = CALL_PROMPT,
         response_prompt: str = RESPONSE_PROMPT,
+        num_examples: Optional[int] = None,
     ):
         self.tools = tools
         self.tool_signatures = tool_signatures
@@ -342,10 +343,15 @@ class PromptBuilder:
         self.response_prompt = response_prompt
 
         # Build useful strings.
-        self.tool_examples_str = self.build_example_string(tool_examples)
+        self.tool_examples_str = self.build_example_string(tool_examples, num_examples)
         self.tool_signatures_str = self.build_tool_signature_string(tool_signatures)
 
-    def build_example_string(self, tool_examples: List[Example]) -> str:
+    def build_example_string(
+        self, tool_examples: List[Example], num_examples: Optional[int]
+    ) -> str:
+        if num_examples:
+            tool_examples = tool_examples[:num_examples]
+
         examples = ""
         num_steps = len(tool_examples[0]["steps"])
 
@@ -469,6 +475,7 @@ class PromptBuilder:
         step_num: Union[int, str],
         available_tools: List[str],
     ) -> str:
+        """Add prompt for next step."""
 
         available_tools_text = ", ".join(available_tools) if available_tools else "None"
 
@@ -483,6 +490,7 @@ class PromptBuilder:
     def add_calls_and_responses(
         self, current_prompt: str, previous_calls: List[str], responses: List[str]
     ) -> str:
+        """Add API calls and responses to step."""
 
         previous_calls_text = (
             "\n".join(previous_calls) if previous_calls else "No previous calls"
@@ -514,6 +522,7 @@ if __name__ == "__main__":
         },
         tool_examples=EXAMPLES,
         tool_probs={"google": 0.8, "wikipedia": 0.8},
+        num_examples=2,
     )
 
     query = "What are the recent breakthroughs in CRISPR gene editing and their ethical implications?"

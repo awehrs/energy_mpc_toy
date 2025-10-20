@@ -4,23 +4,19 @@
 import os
 from dataclasses import dataclass
 
-try:
-    from dotenv import load_dotenv
 
-    load_dotenv()
+from dotenv import load_dotenv
 
-    import requests
-    import calendar
-    import datetime
-    from transformers import AutoModelForSeq2SeqLM, AutoTokenizer
-    from operator import pow, truediv, mul, add, sub
+load_dotenv()
 
-    # Optional imports
-    from googleapiclient.discovery import build
+import requests
+import calendar
+import datetime
+from transformers import AutoModelForSeq2SeqLM, AutoTokenizer
+from operator import pow, truediv, mul, add, sub
 
-except ImportError:
-    print("please run `pip install tools-requirements.txt` first at project directory")
-    exit()
+# Optional imports
+from googleapiclient.discovery import build
 
 
 @dataclass
@@ -33,16 +29,16 @@ class ToolSignature:
 
 GOOGLE_SIGNATURE = ToolSignature(
     call_start="[GOOGLE_SEARCH/]",
-    call_end=r"[GOOGLE_SEARCH\]",
+    call_end="[GOOGLE_SEARCH]",
     response_start="[GOOGLE_RESULTS/]",
-    response_end=r"[GOOGLE_RESULTS\]",
+    response_end="[GOOGLE_RESULTS]",
 )
 
 WIKIPEDIA_SIGNATURE = ToolSignature(
     call_start="[WIKI_SEARCH/]",
-    call_end=r"[WIKI_SEARCH\]",
+    call_end="[WIKI_SEARCH]",
     response_start="[WIKI_RESULTS/]",
-    response_end=r"[WIKI_RESULTS\]",
+    response_end="[WIKI_RESULTS]",
 )
 
 TOOL_SIGNATURES = {

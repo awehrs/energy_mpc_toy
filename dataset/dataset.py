@@ -4,24 +4,26 @@ from typing import Callable, Dict, Optional, Union, List, Tuple
 
 import datasets
 from datasets import load_dataset
+from einops import rearrange
 import numpy as np
 import torch
 import torch.nn as nn
 from torch.utils.data import Dataset
+
+from vllm import LLM, SamplingParams, TokensPrompt
 from transformers import (
     AutoConfig,
     AutoModelForCausalLM,
     AutoTokenizer,
     PretrainedConfig,
+    GenerationConfig,
 )
 
 from prompts import PromptBuilder
 from tools.tools import (
     ToolSignature,
-    GOOGLE_SIGNATURE,
-    WIKIPEDIA_SIGNATURE,
-    TOOL_SIGNATURES,
     TOOL_DICT,
+    TOOL_SIGNATURES,
 )
 
 
@@ -30,7 +32,7 @@ logger = logging.getLogger(__name__)
 
 class PromptDataset(Dataset):
 
-    def __init__(self):
+    def __init__(self, data: datasets.Dataset, memmap: Dict):
         super().__init__()
 
     def __getitem__(self, index):
@@ -42,41 +44,41 @@ class PromptDataset(Dataset):
     @classmethod
     def build_dataset(
         cls,
-        model_name: str,
-        debug: bool,
-        dataset_names: Union[str, List[str]],
-        max_observation_len: int,
-        max_action_len: int,
-        max_prompt_len: int,
-        # prompt_batch_size: int,
-        min_steps: int,
-        max_steps: int,
+        model_name: str = "Qwen/Qwen2.5-32B-Instruct",
+        debug: bool = True,
+        dataset_names: Union[str, List[str]] = "hotpot_qa",
+        max_observation_len: int = 1024,
+        max_action_len: int = 1024,
+        prompt_batch_size: int = 8,
+        min_steps: int = 1,
+        max_steps: int = 3,
         # max_actions: int,
-        tool_ids: List[str],
-        num_trajectories_per_example: int,
+        tool_ids: List[str] = ["google", "wikipedia"],
+        num_trajectories_per_example: int = 2,
         # tools: List[Callable],
-        tool_probs: Dict[str, float],
+        tool_probs: Dict[str, float] = {"google": 0.5, "wikipedia": 0.5},
         # tokenizer: Callable,
+        temperature: int = 0.7,
+        do_sample: bool = True,
+        num_beams: int = 1,
+        num_samples: int = 5,
+        num_few_shot_examples: Optional[int] = None,
     ) -> "PromptDataset":
         """Factory function."""
 
         # Set up language model.
+        model = LLM(
+            model="Qwen/Qwen2-72B-Instruct-AWQ",
+            quantization="awq",
+            max_model_len=16_384,
+            max_num_seqs=32,
+            gpu_memory_utilization=0.90,
+        )
 
-        model_config = AutoConfig.from_pretrained(model_name)
-
-        model = AutoModelForCausalLM.from_pretrained(model_name)
-
-        device = "cuda" if torch.cuda.is_available() else "cpu"
-
-        model.to(device)
-
-        for param in model.parameters():
-            param.requires_grad = False
-
-        model.eval()
+        max_prompt_len = model.llm_engine.model_config.max_model_len
 
         # Set up tokenizer.
-        tokenizer = AutoTokenizer.from_pretrained(model_name)
+        tokenizer = model.get_tokenizer()
 
         # Download base datasets.
         datasets = cls.download_datasets(dataset_names, debug=debug)
@@ -132,6 +134,7 @@ class PromptDataset(Dataset):
                 tool: sig for tool, sig in TOOL_SIGNATURES.items() if tool in tool_ids
             },
             tool_probs=tool_probs,
+            num_examples=num_few_shot_examples,
         )
 
         # Build base prompts
@@ -144,13 +147,8 @@ class PromptDataset(Dataset):
             src_column="prompt_str",
             dst_columns={
                 "tokens": "prompt_tokens",
-                "mask": "prompt_attention_mask",
             },
-            **{
-                "padding": "max_length",
-                "max_length": max_prompt_len,
-                "truncation": True,
-            },
+            **{"max_length": max_prompt_len},
         )
 
         # Add base id column.
@@ -179,24 +177,47 @@ class PromptDataset(Dataset):
             builder=prompt_builder,
             tokenizer=tokenizer,
             step=0,
-            max_len=max_prompt_len,
+            max_steps=max_steps,
+            max_prompt_len=max_prompt_len,
+            max_generation_len=max_action_len,
+            max_observation_len=max_observation_len,
         )
+
+        # Build config for model generation
+        sampling_params = SamplingParams(
+            max_tokens=max_observation_len, skip_special_tokens=True
+        )
+
+        # Add actions column.
+        dataset = dataset.add_column("actions", column=len(dataset) * [[]])
 
         # Build up trajectories
         for step in range(max_steps):
-            ### Start GPU Phase ###
-            model_outputs = None
 
+            ### Start GPU Phase ###
+            dataset = cls.get_model_output(
+                dataset,
+                model=model,
+                tokenizer=tokenizer,
+                batch_size=prompt_batch_size,
+                sampling_params=sampling_params,
+            )
             ### End GPU Phase ###
+
+            assert False
+
+            # Validate model responses
+
+            # Extract api calls from  model responses
+
+            # Create and execute API calls
+
+            # Clean and tokenize responses
+
+            # Update prompt
 
             mock_calls = ["call1", "call2", "call3"]
             mock_resps = ["resp1", "resp2", "resp3"]
-
-            # Decode y to string
-            # Extract api calls from  y
-            # Tokenize api calls, add to dataset["actions"]
-            # Create and execute API calls
-            # Update prompt
 
             # Add calls and responses to prompt.
             dataset = cls.update_prompt(
@@ -204,65 +225,14 @@ class PromptDataset(Dataset):
                 dataset,
                 builder=prompt_builder,
                 tokenizer=tokenizer,
-                step=step + 1,
-                max_len=max_prompt_len,
+                step=step,
+                max_steps=max_steps,
+                max_len_prompt_len=max_prompt_len,
+                max_generation_len=max_action_len,
+                max_observation_len=max_observation_len,
                 calls=mock_calls,
                 responses=mock_resps,
             )
-
-            assert False
-
-        #       For i in step up to this step
-
-        #           For id in tool_ids
-
-        #               tool_i_step_i = cat(tool_ids[id][call_tokens], tool_ids[id][response_tokens])
-
-        #            step_i_tensor = cat([tool_0_step_i, tool_1_step_0])
-
-        #       prompt = cat(base_prompt, step_0_tensor, step_1_tensor, ...)
-
-        #       pad prompt to max_prompt_len
-
-        #       add prompt to dictionary as current_prompt
-
-        #   ### GPU ###
-
-        #   Get API calls.
-
-        #   For batch of examples in examples:
-
-        #       batch = [batch_size, max_prompt_len]
-
-        #       api_calls = model_wrapper(model, batch, num_samples, num_samples_per_example)
-
-        #  ### CPU ###
-
-        #  Post processing
-
-        #  Filter the api_calls
-
-        #      Filter out non conforming responses
-
-        #      Check if there are num_samples_per_example remaining
-
-        #      Do something if not
-
-        #  Clean call
-
-        #       Depending on tool, do some regex stuff to extract what you want
-
-        #  Add call text to dictionary
-
-        #  Batch tokenize the calls, add to dictionary
-
-        #  invoke the APIs
-
-        #      response = tool_id(call_text)
-
-        # Clean response
-
-        #       Regex stuff
 
     @staticmethod
     def download_datasets(
@@ -284,7 +254,8 @@ class PromptDataset(Dataset):
                 )
 
                 if debug:
-                    dataset = dataset.select(range(64))
+                    # CPU debugging.
+                    dataset = dataset.select(range(4))
 
                 dataset_list.append(dataset)
             else:
@@ -342,21 +313,21 @@ class PromptDataset(Dataset):
         **kwargs,
     ) -> datasets.Dataset:
         # Ensure tokenizer has pad_token
-        if tokenizer.pad_token is None:
-            if tokenizer.eos_token is not None:
-                tokenizer.pad_token = tokenizer.eos_token
+        if tokenizer.pad_token_id is None:
+            if tokenizer.eos_token_id is not None:
+                tokenizer.pad_token_id = tokenizer.eos_token_id
             else:
                 raise ValueError("Tokenizer must have pad token")
 
         def tokenize_fn(examples):
             encoding = tokenizer(
                 examples[src_column],
+                add_special_tokens=False,
                 **kwargs,
             )
 
             result = {}
 
-            # Ensure token IDs are properly converted to lists of integers
             result[dst_columns["tokens"]] = [
                 [int(token_id) for token_id in sequence]
                 for sequence in encoding.input_ids
@@ -478,7 +449,10 @@ class PromptDataset(Dataset):
         builder: PromptBuilder,
         tokenizer: Callable,
         step: int,
-        max_len: int,
+        max_steps: int,
+        max_prompt_len: int,
+        max_generation_len: int,
+        max_observation_len: int,
         calls: Optional[List[str]] = None,
         responses: Optional[List[str]] = None,
     ) -> datasets.Dataset:
@@ -517,16 +491,105 @@ class PromptDataset(Dataset):
             src_column="prompt_str",
             dst_columns={
                 "tokens": "prompt_tokens",
-                "mask": "prompt_attention_mask",
             },
-            **{
-                "padding": "max_length",
-                "max_length": max_len,
-                "truncation": True,
-            },
+            **{"max_length": max_prompt_len},
+        )
+
+        self.validate_prompt_len(
+            dataset,
+            step=step,
+            max_steps=max_steps,
+            max_prompt_len=max_prompt_len,
+            max_generation_len=max_generation_len,
+            max_observation_len=max_observation_len,
         )
 
         return dataset
+
+    @staticmethod
+    def validate_prompt_len(
+        dataset: datasets.Dataset,
+        step: int,
+        max_steps: int,
+        max_prompt_len: int,
+        max_generation_len: int,
+        max_observation_len: int,
+    ) -> None:
+        max_valid_tokens = (
+            dataset.to_polars().get_column("prompt_str").str.len_chars().max()
+        )
+
+        tokens_per_step = max_generation_len + max_observation_len
+
+        # Final (nth) step will be "answer", and won't require model prompting
+        remaining_steps = max_steps - step - 1
+
+        if max_valid_tokens > (max_prompt_len - (remaining_steps * tokens_per_step)):
+            raise ValueError(
+                "Prompt is too long to allow generation of necessary subsequent prompts."
+            )
+
+    @staticmethod
+    def get_model_output(
+        dataset: datasets.Dataset,
+        model: nn.Module,
+        tokenizer: Callable,
+        batch_size: int,
+        sampling_params: GenerationConfig,
+    ) -> datasets.Dataset:
+
+        def model_forward(batch):
+            # prompts = [
+            #     TokensPrompt(prompt_token_ids=seq) for seq in batch["prompt_tokens"]
+            # ]
+
+            # output = model.generate(
+            #     prompts,
+            #     sampling_params=sampling_params,
+            # )
+
+            messages = [
+                [
+                    {"role": "system", "content": "You generate API calls..."},
+                    {"role": "user", "content": prompt},
+                ]
+                for prompt in batch["prompt_str"]
+            ]
+
+            output = model.chat(messages, sampling_params=sampling_params)
+
+            token_output = [output[i].outputs[0].token_ids for i in range(len(output))]
+
+            string_output = [output[i].outputs[0].text for i in range(len(output))]
+
+            token_output = rearrange(
+                np.array(token_output), "(b n) t -> b n t", b=batch_size
+            ).tolist()
+
+            string_output = rearrange(
+                np.array(string_output), "(b n) -> b n", b=batch_size
+            ).tolist()
+
+            actions = batch["actions"]
+            updated_actions = []
+
+            for action_seq in actions:
+                action_seq.append(token_output)
+                updated_actions.append(action_seq)
+
+            batch["actions"] = updated_actions
+            batch["calls"] = string_output
+
+            assert False
+
+            return batch
+
+        return dataset.map(
+            model_forward,
+            batched=True,
+            batch_size=batch_size,
+            cache_file_name=None,
+        )
 
     def construct_prompt(self):
         pass
@@ -564,16 +627,4 @@ class PromptDataset(Dataset):
 
 
 if __name__ == "__main__":
-    PromptDataset.build_dataset(
-        model_name="gpt2",
-        debug=True,
-        dataset_names="hotpot_qa",
-        max_observation_len=256,
-        max_action_len=256,
-        max_prompt_len=1024,
-        min_steps=6,
-        max_steps=10,
-        tool_ids=["google", "wikipedia"],
-        tool_probs={"google": 0.5, "wikipedia": 0.5},
-        num_trajectories_per_example=2,
-    )
+    PromptDataset.build_dataset()
