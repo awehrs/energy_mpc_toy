@@ -4,13 +4,16 @@
 # Optimized for local testing with small batches and frequent logging
 
 # Basic Training Parameters
+
 name: debug
 seed: 42
 num_epochs: 2
-max_steps: 3  # Very short runs for debugging
-per_device_train_batch_size: 2  # Small for local testing
+max_steps: 3  
+train_ratio: .9
+per_device_train_batch_size: 2  
 per_device_eval_batch_size: 2
-gradient_accumulation_steps: 2  # Still get effective batch size of 4
+gradient_accumulation_steps: 2  
+show_stats: false
 
 # Learning Rate & Optimization
 learning_rate: 1e-4
@@ -23,7 +26,7 @@ weight_decay: 0.01
 max_grad_norm: 1.0
 
 # Mixed Precision & Compilation (keep simple for debugging)
-mixed_precision: "no"  # Avoid fp16/bf16 issues during debugging
+mixed_precision: "no"  
 torch_compile: false
 torch_compile_mode: "default"
 
@@ -44,8 +47,11 @@ wandb_entity: null
 wandb_run_name: null
 
 # ================================
-# Energy MPC Specific Parameters
+# Action VAE Specific Parameters
 # ================================
+
+free_bits: 0.0
+kl_anneal_steps: 50_000
 
 # Sequence Plot Logging
 plot_logging_frequency: 10  # Plot CE vs Energy frequently
@@ -71,6 +77,7 @@ dataloader_drop_last: true
 # ================================
 
 # Dataset building happens automatically based on file detection
+
 
 # Raw data and preprocessing
 raw_data_path: "data/hotpotqa/hotpot_train_v1.1_debug100.json"

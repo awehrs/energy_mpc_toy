@@ -1,16 +1,17 @@
-# ================================
-# Energy MPC Training Default Config
-# ================================
-# Production training configuration with optimized settings
-
 # Basic Training Parameters
 name: default
 seed: 42
 num_epochs: 3
-max_steps: -1  # Train for full epochs
-per_device_train_batch_size: 16
-per_device_eval_batch_size: 16
+max_steps: -1  
+per_device_train_batch_size: 12
+per_device_eval_batch_size: 12
 gradient_accumulation_steps: 5
+train_ratio: .9
+show_stats: false
+
+action_bucket: "data"
+dataset_name: "action_dataset"
+cache_dir: "/tmp/datasets"
 
 # Learning Rate & Optimization
 learning_rate: 1e-5
@@ -26,7 +27,7 @@ max_grad_norm: 1.0
 mixed_precision: "bf16"  # "none", "fp16", "bf16"
 dtype: bf16
 half_precision_backend: auto
-torch_compile: false
+torch_compile: true
 torch_compile_mode: null
 gradient_checkpointing: false
 
@@ -38,8 +39,8 @@ eval_strategy: "no"
 eval_steps: 500
 eval_accumulation_steps: null
 save_strategy: steps
-save_steps: 2000  # Less frequent checkpointing to reduce bloat warnings
-save_total_limit: 3
+save_steps: 10000
+save_total_limit: 1
 
 # Output & Checkpointing
 output_dir: "data/out"
@@ -51,6 +52,15 @@ wandb_project: "training"
 wandb_entity: awehrs
 wandb_run: null
 wandb_run_name: null
+
+
+# ================================
+# Action VAE Specific Parameters
+# ================================
+
+free_bits: 0.0
+kl_anneal_steps: 50_000
+
 
 # ================================
 # Energy MPC Specific Parameters
@@ -72,7 +82,7 @@ mono_margin: 0.0   # Monotonicity margin
 # ================================
 
 # Dataloader
-dataloader_num_workers: 0
+dataloader_num_workers: 4
 dataloader_pin_memory: true
 dataloader_drop_last: true
 
@@ -90,35 +100,3 @@ disable_tqdm: false
 print_dataset_stats: true
 torch_empty_cache_steps: 100
 prediction_loss_only: true
-
-# ================================
-# Dataset Building Configuration
-# ================================
-
-# Dataset building happens automatically based on file detection
-
-# Raw data and preprocessing
-raw_data_path: "data/hotpotqa/hotpot_train_v1.1.json"
-preprocessing:
-  model_name: "gpt2"
-  chunk_size: 256
-  overlap_size: 32
-
-# Index building
-index_building:
-  model_name: "sentence-transformers/all-MiniLM-L6-v2"
-  index_type: "flat"
-  batch_size: 32
-  device: "cuda"
-
-# Dataset Paths (generated automatically if build_dataset=true)
-chunks_file: null
-examples_file: null
-index_dir: null
-index_name: null
-
-# Optional Evaluation Dataset
-eval_chunks_file: null
-eval_examples_file: null
-eval_index_dir: null
-eval_index_name: null

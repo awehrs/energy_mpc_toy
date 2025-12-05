@@ -1,0 +1,8 @@
+model_name: ${pretrained_lm}
+max_action_len: ${max_action_len}
+max_precept_len: ${max_precept_len}
+null_ratio: .02
+dataset_dir: data/dataset
+debug: true
+dataset_names:
+  - "Agent-Ark/Toucan-1.5M"

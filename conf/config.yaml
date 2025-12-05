@@ -1,27 +1,33 @@
+hydra: 
+  output_subdir: null 
+  job: 
+    chdir: false
+  run: 
+    dir: .
+
 # Main configuration file with defaults
 defaults:
   - model: default
-  - dataset: hotpotqa
+  - dataset: default
   - training: default
+  - accelerate: single
   - _self_ 
 
-# Shared parameters
-max_target_length: 1024
-index_model: "sentence-transformers/all-MiniLM-L6-v2"  
-index_dim: 384
 
-# Model architecture parameters 
+# Model shared params
 dropout: 0.1
-pretrained_lm: gpt2
+d_latent: 768
+d_latent_debug: 256
+pretrained_lm: Qwen/Qwen2.5-Coder-0.5B-Instruct #Qwen/Qwen2.5-Coder-1.5B-Instruct
+pretrained_lm_debug: gpt2
+max_action_len: 2048
+max_precept_len: 2048
 n_self_attn_heads: 8
 n_cross_attn_heads: 8
 
-# Data parameters
-n_docs_default: 8 # Number of documents per retrieval step
-max_steps_default: 8 # Maximum number of retrieval steps
 
-n_docs_debug: 4 
-max_steps_debug: 4
+
+
 
 
     

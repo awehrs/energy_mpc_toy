@@ -1,7 +1,7 @@
 import torch
 import torch.nn as nn
 
-from models.utils import Attention
+from models.attention import Attention
 
 
 class EnergyModel(nn.Module):

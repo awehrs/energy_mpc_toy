@@ -1,29 +1,36 @@
-# Inherited architecture configuration
-n_docs: ${n_docs_debug}
-dropout: ${dropout}
-max_steps: ${max_steps_debug}
-index_dim: ${index_dim}
-pretrained_lm: ${pretrained_lm}
-max_target_length: ${max_target_length}
-n_self_attn_heads: ${n_self_attn_heads}
+# Shared model params
 n_cross_attn_heads: ${n_cross_attn_heads}
+n_self_attn_heads: ${n_self_attn_heads}
+dropout: ${dropout}
 
-# Model wide params.
-d_model: 32
+
+# Action autoencoder 
+action_model:
+  d_latent: ${d_latent_debug}
+  max_action_len: ${max_action_len_debug}
+  n_action_latents: 16
+  n_precept_latents: 16
+  n_encoder_self_attn_layers: 2
+  n_decoder_self_attn_layers: 2
+  model_name: ${pretrained_lm_debug}
+  n_cross_attn_heads: ${model.n_cross_attn_heads}
+  n_self_attn_heads: ${model.n_self_attn_heads}
+  dropout: ${model.dropout}
+
+# Dynamics model
+dynamics_model:
+  model_name: ${pretrained_lm_debug}
+  d_latent: ${d_latent_debug}
+  d_encoder: 256
+  d_ssm: 256
+  n_ssm_layers: 2
+  n_precept_latents: 16
+  n_self_attn_layers: 2
+  n_cross_attn_heads: ${model.n_cross_attn_heads}
+  n_self_attn_heads: ${model.n_self_attn_heads}
+  dropout: ${model.dropout}
+  
 
 
-# Encoder params.
-n_encoder_layers: 1
-n_bottleneck_tokens: 4
 
-# Forward model params.
-n_forward_layers: 1
-n_action_tokens: 1
-
-# Decoder params.
-adapter_dim: 32
-num_prefix_tokens: 1
-
-# Energy params.
-d_energy_model: 32
 

@@ -1,6 +1,7 @@
 import os
 import time
 import logging
+import warnings
 from pathlib import Path
 from typing import Any, Callable, Dict, Optional
 
@@ -9,8 +10,13 @@ import torch.nn as nn
 from torch.utils.data import DataLoader
 from omegaconf import DictConfig
 from accelerate import Accelerator
-from accelerate.utils import set_seed, DistributedDataParallelKwargs, TorchDynamoPlugin
+from accelerate.utils import set_seed
 
+torch.set_float32_matmul_precision("high")
+
+warnings.filterwarnings("ignore", message=".*Mismatch dtype between input and weight.*")
+
+os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "max_split_size_mb:512"
 
 try:
     import wandb
@@ -47,12 +53,15 @@ class AccelerateTrainer:
         self.train_dataset = train_dataset
         self.eval_dataset = eval_dataset
         self.eval_fn = eval_fn or self._default_eval_fn
+
+        if tokenizer.pad_token_id is None:
+            if tokenizer.eos_token_id is not None:
+                tokenizer.pad_token_id = tokenizer.eos_token_id
+            else:
+                raise ValueError("Tokenizer must have pad token")
+
         self.tokenizer = tokenizer
 
-        os.environ.setdefault("ACCELERATE_USE_DDP_FIND_UNUSED_PARAMETERS", "true")
-        ddp_kwargs = DistributedDataParallelKwargs(find_unused_parameters=True)
-
-        # Initialize Accelerator with dynamo plugin if torch.compile is requested
         kwargs = {
             "gradient_accumulation_steps": config.gradient_accumulation_steps,
             "mixed_precision": (
@@ -60,28 +69,28 @@ class AccelerateTrainer:
             ),
             "log_with": "wandb" if config.log_wandb and WANDB_AVAILABLE else None,
             "project_dir": config.output_dir,
-            "kwargs_handlers": [ddp_kwargs],
         }
 
         total_params = sum(p.numel() for p in model.parameters())
         trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-        self._param_counts = {"total": total_params, "trainable": trainable_params}
 
-        if config.torch_compile:
-            dynamo_plugin = TorchDynamoPlugin(
-                backend="inductor",
-                mode=config.torch_compile_mode,
-                fullgraph=False,
-                dynamic=True,
-                disable_print_graph=True,
-            )
-            kwargs["dynamo_plugin"] = dynamo_plugin
-            self.accelerator = Accelerator(**kwargs)
-            self.accelerator.print(
-                f"Using Accelerate dynamo backend with mode: {config.torch_compile_mode}"
-            )
-        else:
-            self.accelerator = Accelerator(**kwargs)
+        self._param_counts = {"total": total_params, "trainable": trainable_params}
+        self.accelerator = Accelerator(**kwargs)
+
+        print(f"=" * 80)
+        print(f"Rank {self.accelerator.process_index}:")
+        print(f"  LOCAL_RANK env var: {os.environ.get('LOCAL_RANK', 'NOT SET')}")
+        print(
+            f"  CUDA_VISIBLE_DEVICES: {os.environ.get('CUDA_VISIBLE_DEVICES', 'NOT SET')}"
+        )
+        print(f"  torch.cuda.device_count(): {torch.cuda.device_count()}")
+        print(f"  torch.cuda.current_device(): {torch.cuda.current_device()}")
+        print(f"  accelerator.device: {self.accelerator.device}")
+        print(
+            f"  accelerator.local_process_index: {self.accelerator.local_process_index}"
+        )
+        print(f"  accelerator.num_processes: {self.accelerator.num_processes}")
+        print(f"=" * 80)
 
         self.accelerator.print(f"Accelerator state: {self.accelerator.state}")
         self.accelerator.print(f"Mixed precision: {self.accelerator.mixed_precision}")
@@ -94,12 +103,8 @@ class AccelerateTrainer:
 
         self.model = model
 
-        # self.model = torch.compile(
-        #     self.model,
-        #     mode=config.torch_compile_mode,
-        #     fullgraph=False,  # Important for complex models
-        #     dynamic=True,  # Handle variable shapes better
-        # )
+        if config.torch_compile:
+            self.model = self._compile()
 
         # Initialize optimizer
         self.optimizer = self._create_optimizer()
@@ -114,9 +119,10 @@ class AccelerateTrainer:
         if config.max_steps > 0:
             self.total_steps = config.max_steps
         else:
-            steps_per_epoch = (
-                len(train_dataloader) // config.gradient_accumulation_steps
+            total_batches = len(self.train_dataset) // (
+                config.per_device_train_batch_size * self.accelerator.num_processes
             )
+            steps_per_epoch = total_batches // config.gradient_accumulation_steps
             self.total_steps = steps_per_epoch * config.num_epochs
 
         # Initialize learning rate scheduler
@@ -168,6 +174,12 @@ class AccelerateTrainer:
         if self.accelerator.is_main_process:
             Path(config.output_dir).mkdir(parents=True, exist_ok=True)
 
+    def _compile(self) -> None:
+        self.model = torch.compile(
+            self.model,
+            mode=self.config.torch_compile_mode,
+        )
+
     def _create_optimizer(self) -> torch.optim.Optimizer:
         """Create the optimizer."""
         return torch.optim.AdamW(
@@ -213,7 +225,7 @@ class AccelerateTrainer:
         with torch.no_grad():
             for batch in eval_dataloader:
                 with self.accelerator.autocast():
-                    loss = self._compute_loss(batch)
+                    loss, additional_metrics = self._compute_loss(batch)
 
                 # Simple accumulation without gathering
                 total_loss += loss.item()
@@ -231,7 +243,10 @@ class AccelerateTrainer:
             total_loss = total_loss.item() / self.accelerator.num_processes
             num_samples = num_samples.item() / self.accelerator.num_processes
 
-        return {"eval_loss": total_loss / num_samples}
+        return {
+            "eval_loss": total_loss / num_samples,
+            **additional_metrics,
+        }
 
     # MAKE this more generic in AccelerateTrainer:
     def _create_dataloader(self, dataset, is_train=True):
@@ -405,13 +420,19 @@ class AccelerateTrainer:
             self.epoch = epoch
 
             for step, batch in enumerate(self.train_dataloader):
+
                 with self.accelerator.accumulate(self.model):
+
                     # Forward pass
                     with self.accelerator.autocast():
-                        loss = self._compute_loss(batch)
+                        fwd_start = time.time()
+                        loss, additional_metrics = self._compute_loss(batch)
+                        logger.info(f"Forward: {time.time() - fwd_start:.2f}s")
 
                     # Backward pass
+                    bwd_start = time.time()
                     self.accelerator.backward(loss)
+                    logger.info(f"Backward: {time.time() - bwd_start:.2f}s")
 
                     # Gradient clipping
                     if self.config.max_grad_norm is not None:
@@ -425,12 +446,21 @@ class AccelerateTrainer:
                     self.optimizer.step()
                     self.lr_scheduler.step()
                     self.optimizer.zero_grad()
+                    torch.cuda.empty_cache()
 
                 # Accumulate loss (only log on accumulation boundary)
                 total_loss += loss.detach().float()
 
                 # Only log/save on accumulation boundaries
                 if self.accelerator.sync_gradients:
+
+                    if self.global_step % 10 == 0:
+                        allocated = torch.cuda.memory_allocated() / 1e9
+                        reserved = torch.cuda.memory_reserved() / 1e9
+                        logging.info(
+                            f"Step {step}: Allocated {allocated:.2f}GB, Reserved {reserved:.2f}GB"
+                        )
+
                     # Logging
                     if self.global_step % self.config.logging_steps == 0:
                         current_time = time.time()
@@ -452,100 +482,8 @@ class AccelerateTrainer:
                             ),
                             "steps_per_sec": steps_per_sec,
                             "epoch": epoch,
+                            **additional_metrics,
                         }
-
-                        # Add individual loss components if available (for subclasses)
-                        if (
-                            hasattr(self, "_last_batch_metrics")
-                            and self._last_batch_metrics
-                        ):
-                            # Common metrics
-                            common_metrics = {
-                                "decode_loss": self._last_batch_metrics.get(
-                                    "loss/decode", 0
-                                ),
-                                "energy_loss": self._last_batch_metrics.get(
-                                    "loss/energy", 0
-                                ),
-                                "mono_loss": self._last_batch_metrics.get(
-                                    "loss/mono", 0
-                                ),
-                                "forward_loss": self._last_batch_metrics.get(
-                                    "loss/forward", 0
-                                ),
-                                # Add latent diversity metrics
-                                "latent_variance": self._last_batch_metrics.get(
-                                    "chunk_avg_variance",
-                                    self._last_batch_metrics.get(
-                                        "latent_avg_variance", 0
-                                    ),
-                                ),
-                                "latent_distance": self._last_batch_metrics.get(
-                                    "chunk_avg_distance",
-                                    self._last_batch_metrics.get(
-                                        "latent_avg_distance", 0
-                                    ),
-                                ),
-                                "latent_participation": self._last_batch_metrics.get(
-                                    "chunk_participation_ratio",
-                                    self._last_batch_metrics.get(
-                                        "latent_participation_ratio", 0
-                                    ),
-                                ),
-                                # Add decode loss progression metrics
-                                "decode_monotonic_pct": self._last_batch_metrics.get(
-                                    "decode_monotonic_sequences", 0
-                                ),
-                                "decode_avg_step_drop": self._last_batch_metrics.get(
-                                    "decode_avg_step_drop", 0
-                                ),
-                                "decode_total_drop": self._last_batch_metrics.get(
-                                    "decode_total_drop", 0
-                                ),
-                                "decode_first_step": self._last_batch_metrics.get(
-                                    "decode_first_step_loss", 0
-                                ),
-                                "decode_last_step": self._last_batch_metrics.get(
-                                    "decode_last_step_loss", 0
-                                ),
-                            }
-
-                            # Phase 1 specific metrics
-                            if "monotonic_bonus" in self._last_batch_metrics:
-                                common_metrics["monotonic_bonus"] = (
-                                    self._last_batch_metrics.get("monotonic_bonus", 0)
-                                )
-
-                            # Full training specific metrics (energy/forward)
-                            if "avg_energy_loss" in self._last_batch_metrics:
-                                common_metrics.update(
-                                    {
-                                        "energy_loss": self._last_batch_metrics.get(
-                                            "avg_energy_loss", 0
-                                        ),
-                                        "forward_loss": self._last_batch_metrics.get(
-                                            "avg_forward_loss", 0
-                                        ),
-                                        "energy_weight": self._last_batch_metrics.get(
-                                            "current_energy_weight", 0
-                                        ),
-                                        # Add energy-decode alignment metrics
-                                        "energy_decode_corr": self._last_batch_metrics.get(
-                                            "energy_decode_correlation", 0
-                                        ),
-                                        "energy_follows_pct": self._last_batch_metrics.get(
-                                            "energy_follows_decode_pct", 0
-                                        ),
-                                        "decode_improvement": self._last_batch_metrics.get(
-                                            "avg_decode_improvement", 0
-                                        ),
-                                        "energy_drop": self._last_batch_metrics.get(
-                                            "avg_energy_drop", 0
-                                        ),
-                                    }
-                                )
-
-                            metrics.update(common_metrics)
 
                         self._log_metrics(metrics, self.global_step)
                         start_time = current_time
@@ -555,9 +493,11 @@ class AccelerateTrainer:
                     # Evaluation
                     if (
                         self.eval_dataloader is not None
+                        and self.global_step > 0
                         and self.config.eval_steps > 0
                         and self.global_step % self.config.eval_steps == 0
                     ):
+                        logging.info("Beginning evaluation...")
 
                         eval_metrics = self.eval_fn(self.eval_dataloader)
                         eval_metrics = {

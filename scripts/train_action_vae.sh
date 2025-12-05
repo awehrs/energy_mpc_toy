@@ -2,10 +2,14 @@
 source .env
 
 # Configuration
-INSTANCE_TYPE=gpu_1x_a100_sxm4 
+INSTANCE_TYPE=gpu_1x_h100_pcie #gpu_8x_a100_80gb_sxm4
 SSH_NAME=scoobdoob
 SSH_PATH=~/.ssh/scoobdoob.pem
-PROJECT_NAME=foveated_lm
+GCS_BUCKET=energy-mpc
+LOCAL_CACHE=/tmp/datasets
+DATASET_NAME=action_dataset
+PROJECT_NAME=energy_mpc_toy
+
 
 echo "🚀 Setting up action VAE training on Lambda Labs..."
 
@@ -171,6 +175,10 @@ cleanup() {
 trap cleanup EXIT
 
 # Sync project code
+cp ~/.config/gcloud/servicekey.json ./servicekey.json
+
+# Add to gitignore
+echo "servicekey.json" >> .gitignore
 echo "📁 Syncing project code..."
 rsync -av --progress \
     --exclude='.git' \
@@ -179,8 +187,12 @@ rsync -av --progress \
     --exclude='.env' \
     --exclude='wandb' \
     --exclude='outputs' \
+    --exclude='.venv' \
+    --exclude='tests' \
     -e "ssh -o BatchMode=yes -o StrictHostKeyChecking=accept-new -i ${SSH_PATH}" \
     . ubuntu@${INSTANCE_IP}:~/${PROJECT_NAME}/
+
+rm ./servicekey.json
 
 echo "✅ Code synced"
 
@@ -193,6 +205,9 @@ set -e
 
 PROJECT_NAME=$1
 WANDB_API_KEY=$2
+GCS_BUCKET=$3 
+LOCAL_CACHE=$4      
+DATASET_NAME=$5
 
 echo "⚡ Installing uv..."
 
@@ -200,7 +215,7 @@ echo "⚡ Installing uv..."
 curl -LsSf https://astral.sh/uv/install.sh | sh
 
 # Add uv to PATH for this session
-export PATH="$HOME/.cargo/bin:$PATH"
+source $HOME/.local/bin/env
 
 echo "🐍 Setting up Python environment with uv..."
 
@@ -211,9 +226,11 @@ cd ~/${PROJECT_NAME}
 uv sync
 
 # Set environment variables
+export GOOGLE_APPLICATION_CREDENTIALS="./servicekey.json"
+export GCS_BUCKET=${GCS_BUCKET}
+
 export TOKENIZERS_PARALLELISM=false
 export WANDB_API_KEY=$WANDB_API_KEY
-export CUDA_VISIBLE_DEVICES=0
 
 echo "🔥 Starting training..."
 echo "GPU Info:"
@@ -223,10 +240,102 @@ echo "Python Info:"
 uv run python --version
 uv pip list | grep torch
 
-# Run training (model will auto-save to WandB)
-uv run python training/action_vae.py 
+# Set up cloud authorizations.
+
+if [ -f "./servicekey.json" ]; then
+    echo "✅ Key file exists, size: $(wc -c < ./servicekey.json) bytes"
+else
+    echo "❌ Key file missing!"
+    ls -la
+    exit 1
+fi
+
+gcloud auth activate-service-account --key-file=./servicekey.json
+
+# Get dataset. 
+
+uv run python --version
+uv pip list | grep torch
+
+# Set up cloud authorizations.
+
+if [ -f "./servicekey.json" ]; then
+    echo "✅ Key file exists, size: $(wc -c < ./servicekey.json) bytes"
+else
+    echo "❌ Key file missing!"
+    ls -la
+    exit 1
+fi
+
+gcloud auth activate-service-account --key-file=./servicekey.json
+
+# Get dataset. 
+if gsutil ls "gs://$GCS_BUCKET/datasets/${DATASET_NAME}.tar.gz" &> /dev/null; then
+    echo "Downloading compressed dataset from GCS..."
+    mkdir -p "$LOCAL_CACHE"
+    gsutil -m cp "gs://$GCS_BUCKET/datasets/${DATASET_NAME}.tar.gz" "$LOCAL_CACHE/"
+    
+    # Decompress
+    echo "Decompressing dataset..."
+    tar -I pigz -xf "$LOCAL_CACHE/${DATASET_NAME}.tar.gz" -C "$LOCAL_CACHE"
+    
+    echo "Cleaning up compressed file..."
+    rm "$LOCAL_CACHE/${DATASET_NAME}.tar.gz"
+    
+    echo "✅ Dataset downloaded and decompressed"
+else
+    # Build locally if not in GCS
+    echo "Dataset not in GCS, building locally..."
+    cd ~/${PROJECT_NAME}
+    uv run python dataset/action_dataset.py
+    
+    # Check if build succeeded
+    if [ ! -d "$LOCAL_CACHE/$DATASET_NAME" ]; then
+        echo "❌ Dataset build failed - directory not found at $LOCAL_CACHE/$DATASET_NAME"
+        exit 1
+    fi
+    
+    echo "✅ Dataset built successfully"
+    
+    # Compress and upload
+    echo "Compressing dataset..."
+    tar -I pigz -cf "$LOCAL_CACHE/${DATASET_NAME}.tar.gz" -C "$LOCAL_CACHE" "${DATASET_NAME}/"
+    
+    echo "Uploading compressed dataset..."
+    gsutil -m cp "$LOCAL_CACHE/${DATASET_NAME}.tar.gz" "gs://$GCS_BUCKET/datasets/"
+    
+    echo "Cleaning up compressed file..."
+    rm "$LOCAL_CACHE/${DATASET_NAME}.tar.gz"
+    
+    echo "✅ Dataset uploaded to GCS"
+fi
+
+# Continue with training
+cd ~/${PROJECT_NAME}
+
+# Train.
+
+cd ~/${PROJECT_NAME}
+
+uv run accelerate launch training/train_action_vae.py 
+
+TRAIN_EXIT_CODE=$?
 
 echo "✅ Training completed!"
+
+# Upload to GCS (runs on the remote instance where files exist)
+
+if [ $TRAIN_EXIT_CODE -eq 0 ]; then
+    echo "📤 Uploading to GCS..."
+    
+    if [ -d "data/out" ]; then
+        gsutil -m cp -r data/out/ gs://$GCS_BUCKET/training/action-model/$(date +%Y%m%d_%H%M%S)/
+        echo "✅ Upload complete"
+    else
+        echo "❌ No outputs found"
+    fi
+fi
+
 EOF
 
 # Copy and run the setup script
@@ -236,9 +345,15 @@ scp -o BatchMode=yes -o StrictHostKeyChecking=accept-new -i $SSH_PATH \
 # Clean up local setup script
 rm -f setup_and_train.sh
 
+# Pass GCS_BUCKET as third argument
 ssh -o BatchMode=yes -o StrictHostKeyChecking=accept-new -i $SSH_PATH \
     ubuntu@${INSTANCE_IP} \
-    "chmod +x setup_and_train.sh && ./setup_and_train.sh ${PROJECT_NAME} ${WANDB_API_KEY}"
+    "chmod +x setup_and_train.sh && ./setup_and_train.sh \
+    ${PROJECT_NAME} \
+    ${WANDB_API_KEY} \
+    ${GCS_BUCKET} \
+    ${LOCAL_CACHE} \
+    ${DATASET_NAME}"
 
 echo "🎉 Training job completed!"
 

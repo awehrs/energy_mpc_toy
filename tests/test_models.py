@@ -6,11 +6,11 @@ from transformers import GPT2LMHeadModel, GPT2Config, GPT2Model
 import os
 
 from models.action_projector import ActionProjection
-from models.actuator import Decoder
-from models.sensor import Encoder
+from models.actuators import Decoder
+from models.sensors import Encoder
 from models.energy_model import EnergyModel
-from models.forward_model import ForwardModel
-from models.model import Model
+from models.dynamics_model import ForwardModel
+from models.flow_model import Model
 
 
 @pytest.mark.parametrize("batch_size,latent_len,latent_dim", [(2, 10, 256)])

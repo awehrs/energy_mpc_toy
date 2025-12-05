@@ -1,4 +1,3 @@
-import math
 from typing import Optional
 
 import torch
@@ -25,7 +24,6 @@ class Attention(nn.Module):
         self.d_model = d_model
         self.n_heads = n_heads
         self.head_dim = d_model // n_heads
-        self.scale = 1.0 / math.sqrt(self.head_dim)
 
         # Input/output dimensions (default to d_model if not specified)
         self.query_dim = query_dim if query_dim is not None else d_model
@@ -39,7 +37,7 @@ class Attention(nn.Module):
         self.v_proj = nn.Linear(self.value_dim, d_model, bias=False)
 
         # Output projection to desired output dimension
-        self.out_proj = nn.Linear(d_model, self.output_dim)
+        self.out_proj = nn.Linear(d_model, self.output_dim, bias=False)
 
         self.dropout = dropout
 
@@ -71,23 +69,28 @@ class Attention(nn.Module):
         k_len = key.shape[1]
 
         # Project to internal d_model dimension
-        Q = self.q_proj(query)  # [batch, q_len, d_model]
-        K = self.k_proj(key)  # [batch, k_len, d_model]
-        V = self.v_proj(value)  # [batch, k_len, d_model]
+        Q = self.q_proj(query)
+        K = self.k_proj(key)
+        V = self.v_proj(value)
 
         # Reshape for multi-head attention
         Q = Q.view(batch_size, q_len, self.n_heads, self.head_dim).transpose(1, 2)
         K = K.view(batch_size, k_len, self.n_heads, self.head_dim).transpose(1, 2)
         V = V.view(batch_size, k_len, self.n_heads, self.head_dim).transpose(1, 2)
 
-        # Use PyTorch's Flash Attention (SDPA)
+        # Reshape attention mask.
+        if attn_mask is not None:
+            attn_mask = attn_mask.unsqueeze(1).unsqueeze(1).float()
+            attn_mask = attn_mask.masked_fill(attn_mask == 0, float("-inf"))
+            attn_mask = attn_mask.masked_fill(attn_mask == 1, 0.0)
+
+        # Use Flash Attention (SDPA)
         attn_output = F.scaled_dot_product_attention(
             Q,
             K,
             V,
             attn_mask=attn_mask,
             dropout_p=self.dropout if self.training else 0.0,
-            scale=self.scale,
         )
 
         # Reshape back to [batch, q_len, d_model]
@@ -101,7 +104,27 @@ class Attention(nn.Module):
         return self.out_proj(attn_output)  # [batch, q_len, output_dim]
 
 
+class MLP(nn.Module):
+    """MLP with SwiGLU activation function."""
+
+    def __init__(self, d_model: int):
+        super().__init__()
+
+        hidden_dim = int(8 * d_model / 3)
+
+        self.w1 = nn.Linear(d_model, hidden_dim, bias=False)
+        self.w2 = nn.Linear(d_model, hidden_dim, bias=False)
+        self.w3 = nn.Linear(hidden_dim, d_model, bias=False)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        gate = F.silu(self.w1(x))
+        data = self.w2(x)
+
+        return self.w3(gate * data)
+
+
 class TransformerBlock(nn.Module):
+    """Transformer block with pre-RMSNorm"""
 
     def __init__(
         self,
@@ -119,18 +142,12 @@ class TransformerBlock(nn.Module):
             [
                 nn.ModuleDict(
                     {
+                        "norm1": nn.RMSNorm(d_model),
                         "self_attn": Attention(
                             d_model=d_model, n_heads=n_heads, dropout=dropout
                         ),
-                        "norm1": nn.LayerNorm(d_model),
-                        "ffn": nn.Sequential(
-                            nn.Linear(d_model, 4 * d_model),
-                            nn.GELU(),
-                            nn.Dropout(dropout),
-                            nn.Linear(4 * d_model, d_model),
-                            nn.Dropout(dropout),
-                        ),
-                        "norm2": nn.LayerNorm(d_model),
+                        "norm2": nn.RMSNorm(d_model),
+                        "ffn": MLP(d_model),
                     }
                 )
                 for _ in range(n_layers)
@@ -145,9 +162,8 @@ class TransformerBlock(nn.Module):
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
             if module.bias is not None:
                 torch.nn.init.zeros_(module.bias)
-        elif isinstance(module, nn.LayerNorm):
+        elif isinstance(module, nn.RMSNorm):
             torch.nn.init.ones_(module.weight)
-            torch.nn.init.zeros_(module.bias)
 
     def forward(self, inputs: torch.Tensor) -> torch.Tensor:
         """
@@ -160,15 +176,17 @@ class TransformerBlock(nn.Module):
 
         for layer in self.layers:
             # Self-attention within latent
-            attn_out = layer["self_attn"](x)
-            x = layer["norm1"](x + attn_out)
+            norm1_out = layer["norm1"](x)
+            attn_out = layer["self_attn"](norm1_out)
+
+            # Residual stream.
+            x = x + attn_out
 
             # Feed-forward
-            ffn_out = layer["ffn"](x)
-            x = layer["norm2"](x + ffn_out)
+            norm2_out = layer["ffn"](x)
+            ffn_out = layer["norm2"](norm2_out)
+
+            # Residual stream.
+            x = x + ffn_out
 
         return x
-
-
-class DownSampler:
-    """Cross Attention based downsampler."""
