@@ -1,14 +1,16 @@
-from typing import Dict
+from typing import Dict, Optional
 
-from omegaconf import DictConfig
-from jaxtyping import Float
 import torch
 import torch.nn as nn
+from einops import repeat
+from omegaconf import DictConfig
+from jaxtyping import Bool, Int, Int32, Int64, Float
+from transformers import Qwen2Config
+from transformers.models.qwen2.modeling_qwen2 import Qwen2RotaryEmbedding
+
 
 from models.actuators import LanguageActuator
 from models.attention import Attention, TransformerBlock
-
-from typing import Dict, Optional
 
 
 class VariationalEncoder(nn.Module):
@@ -37,11 +39,20 @@ class VariationalEncoder(nn.Module):
             embedding_dim=d_model,
         )
 
+        self.rotary_emb = Qwen2RotaryEmbedding(
+            config=Qwen2Config(
+                hidden_size=d_model,
+                num_attention_heads=n_cross_attn_heads,
+            )
+        )
+
         self.query = nn.Parameter(torch.randn(n_latents, d_model) * 0.02)
 
         self.cross_attention = Attention(
             d_model=d_model,
             n_heads=n_cross_attn_heads,
+            dropout=dropout,
+            is_cross_attention=True,
             query_dim=d_model,
             key_dim=d_input if d_input is not None else d_model,
             value_dim=d_input,
@@ -75,37 +86,62 @@ class VariationalEncoder(nn.Module):
 
     def forward(
         self,
-        input_ids: Optional[torch.Tensor] = None,
-        attention_mask: Optional[torch.Tensor] = None,
-    ) -> Dict[str, torch.Tensor]:
-        """
-        Args:
-            inputs_ids: [batch, seq_len]
-            inputs_embeddings: [batch, seq_len, input_dim]
-            attention_mask: [batch, seq_len]
+        input_ids: Int[torch.Tensor, "batch seq_len"],
+        max_seq_len: Optional[int] = None,
+        cu_seq_lens: Optional[Int32[torch.Tensor, "batch+1"]] = None,
+        position_ids: Optional[Int64[torch.Tensor, "total_length"]] = None,
+        attn_mask: Optional[Bool[torch.Tensor, "batch seq_len"]] = None,
+    ) -> Dict[str, Float[torch.Tensor, "n_latents latent dim"]]:
 
-        Returns: dictionary of:
-            mean: [batch, n_latents, d_model]
-            log_var: [batch, n_latents, d_model]
-        """
         inputs = self.input_embedding(input_ids)
 
-        batch_size, _, _ = inputs.shape
-
-        query = self.query.expand(batch_size, -1, -1)
+        if max_seq_len is not None:
+            # Doing sequence packing.
+            batch_size = len(cu_seq_lens) - 1
+            max_seq_len_q = self.query.shape[0]
+            cu_seq_lens_q = (
+                torch.arange(
+                    len(cu_seq_lens),
+                    dtype=torch.int32,
+                    device=inputs.device,
+                )
+                * max_seq_len_q
+            )
+            query = repeat(
+                self.query, "n_latents dim -> (b n_latents) dim", b=batch_size
+            )
+            if position_ids is not None:
+                position_emb = self.rotary_emb(
+                    inputs.unsqueeze(0), position_ids.unsqueeze(0)
+                )
+        else:
+            # Not doing sequence packing.
+            batch_size, _, _ = inputs.shape
+            query = self.query.expand(batch_size, -1, -1)
+            max_seq_len_q = None
+            cu_seq_lens_q = None
+            position_emb = self.rotary_emb(inputs, position_ids)
 
         latent = self.cross_attention(
             query=query,
             key=inputs,
-            value=inputs,
-            attn_mask=attention_mask,
+            position_emb=position_emb,
+            max_seq_len_k=max_seq_len,
+            max_seq_len_q=max_seq_len_q,
+            cu_seq_lens_k=cu_seq_lens,
+            cu_seq_lens_q=cu_seq_lens_q,
+            attn_mask=attn_mask,
         )
 
-        latent = self.pooling_norm(latent)
+        latent = self.pooling_norm(latent).to(torch.bfloat16)
 
-        latent = self.self_attn_layers(latent)
+        latent = self.self_attn_layers(
+            q=latent,
+            cu_seq_lens_q=cu_seq_lens_q,
+            max_seq_len_q=max_seq_len_q,
+        )
 
-        latent = self.final_norm(latent)
+        latent = self.final_norm(latent).to(torch.bfloat16)
 
         mu = self.mu_projection(latent)
 
@@ -134,9 +170,12 @@ class VariationalAutoEncoder(nn.Module):
         super().__init__()
 
         self.config = config
+        self.d_latent = d_latent
+        self.n_latents = n_latents
 
         self.generative_model = LanguageActuator(
             model_name=model_name,
+            n_latents=n_latents,
             latent_dim=d_latent,
             n_self_attn_layers=n_decoder_self_attn_layers,
             n_self_attn_heads=n_self_attn_heads,
@@ -161,12 +200,38 @@ class VariationalAutoEncoder(nn.Module):
     def forward(
         self,
         input_ids: Float[torch.Tensor, "batch seq_len"],
-        attention_mask: Float[torch.Tensor, "batch seq_len"],
+        max_seq_len: Optional[int] = None,
+        cu_seq_lens: Optional[Int32[torch.Tensor, "batch+1"]] = None,
+        token_indices: Optional[Int64[torch.Tensor, "total_batch_tokens"]] = None,
+        latent_indices: Optional[Int64[torch.Tensor, "total_batch_latents"]] = None,
+        position_ids: Optional[Int64[torch.Tensor, "batch*seq_len"]] = None,
+        adjusted_position_ids: Optional[Int64[torch.Tensor, "batch*seq_len"]] = None,
+        attn_mask: Optional[Bool[torch.Tensor, "batch*seq_len"]] = None,
     ) -> Dict[str, Float[torch.Tensor, "batch seq_len dim"]]:
+
+        if attn_mask is not None:
+            # We're not using Flash Attention.
+            assert max_seq_len is None
+            assert cu_seq_lens is None
+            assert position_ids is None
+            assert token_indices is None
+            assert latent_indices is None
+            assert adjusted_position_ids is None
+
+        if position_ids is not None:
+            # We're doing sequence packing + Flash Attention.
+            assert attn_mask is None
+            assert max_seq_len is not None
+            assert cu_seq_lens is not None
+            assert latent_indices is not None
+            assert adjusted_position_ids is not None
 
         variational_params = self.recognition_model(
             input_ids=input_ids,
-            attention_mask=attention_mask,
+            max_seq_len=max_seq_len,
+            cu_seq_lens=cu_seq_lens,
+            position_ids=position_ids,
+            attn_mask=attn_mask,
         )
 
         mu = variational_params["mean"]
@@ -180,11 +245,14 @@ class VariationalAutoEncoder(nn.Module):
         epsilon = torch.randn_like(mu)
         sigma = (0.5 * log_sigma).exp()
         z = mu + sigma * epsilon
+        z = z.to(torch.bfloat16)
 
         logits = self.generative_model(
             z,
             target_tokens=input_ids,
-            attention_mask=attention_mask,
+            token_indices=token_indices,
+            latent_indices=latent_indices,
+            position_ids=adjusted_position_ids,
         )
 
         return {

@@ -2,6 +2,7 @@ model_name: ${pretrained_lm}
 max_action_len: ${max_action_len}
 max_precept_len: ${max_precept_len}
 null_ratio: .02
+pad: true
 dataset_dir: data/dataset
 debug: false
 dataset_names:

@@ -6,17 +6,20 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Optional
 
 import torch
+import torch._dynamo
 import torch.nn as nn
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Dataset
 from omegaconf import DictConfig
 from accelerate import Accelerator
 from accelerate.utils import set_seed
 
 torch.set_float32_matmul_precision("high")
 
+torch._dynamo.config.optimize_ddp = False
+
 warnings.filterwarnings("ignore", message=".*Mismatch dtype between input and weight.*")
 
-os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "max_split_size_mb:512"
+os.environ["PYTORCH_ALLOC_CONF"] = "max_split_size_mb:512"
 
 try:
     import wandb
@@ -38,13 +41,40 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 
+class Timer:
+    def __init__(self, alpha=0.1):
+        """
+        alpha: smoothing factor
+        - Higher alpha (e.g., 0.3) = more weight on recent values
+        - Lower alpha (e.g., 0.05) = smoother, slower to adapt
+        """
+        self.alpha = alpha
+        self.fwd_avg = None
+        self.bwd_avg = None
+
+    def update_fwd(self, time):
+        if self.fwd_avg is None:
+            self.fwd_avg = time
+        else:
+            self.fwd_avg = self.alpha * time + (1 - self.alpha) * self.fwd_avg
+
+    def update_bwd(self, time):
+        if self.bwd_avg is None:
+            self.bwd_avg = time
+        else:
+            self.bwd_avg = self.alpha * time + (1 - self.alpha) * self.bwd_avg
+
+
 class AccelerateTrainer:
     def __init__(
         self,
         model: nn.Module,
         config: DictConfig,
-        train_dataset: torch.utils.data.Dataset,
-        eval_dataset: Optional[torch.utils.data.Dataset] = None,
+        train_dataset: Dataset,
+        eval_dataset: Optional[Dataset] = None,
+        collate_fn: Optional[Callable] = None,
+        sampler: Optional[Callable] = None,
+        batch_sampler: Optional[Callable] = None,
         eval_fn: Optional[Callable] = None,
         tokenizer: Optional[Any] = None,
     ):
@@ -110,10 +140,22 @@ class AccelerateTrainer:
         self.optimizer = self._create_optimizer()
 
         # Create dataloaders
-        train_dataloader = self._create_dataloader(self.train_dataset, is_train=True)
+        train_dataloader = self._create_dataloader(
+            self.train_dataset,
+            is_train=True,
+            collate_fn=collate_fn,
+            sampler=sampler,
+            batch_sampler=batch_sampler,
+        )
         eval_dataloader = None
         if self.eval_dataset is not None:
-            eval_dataloader = self._create_dataloader(self.eval_dataset, is_train=False)
+            eval_dataloader = self._create_dataloader(
+                self.eval_dataset,
+                is_train=False,
+                collate_fn=collate_fn,
+                sampler=sampler,
+                batch_sampler=batch_sampler,
+            )
 
         # Calculate total training steps
         if config.max_steps > 0:
@@ -248,14 +290,22 @@ class AccelerateTrainer:
             **additional_metrics,
         }
 
-    # MAKE this more generic in AccelerateTrainer:
-    def _create_dataloader(self, dataset, is_train=True):
+    def _create_dataloader(
+        self,
+        dataset: torch.utils.data.Dataset,
+        is_train: bool = True,
+        collate_fn: Callable = None,
+        sampler: Callable = None,
+        batch_sampler: Callable = None,
+    ) -> DataLoader:
         """Create dataloader. Can be overridden for custom collation."""
         return DataLoader(
             dataset,
             batch_size=self._get_batch_size(is_train),
             shuffle=is_train,
-            collate_fn=getattr(self, "collate_fn", None),  # Allow custom collation
+            sampler=sampler,
+            batch_sampler=batch_sampler,
+            collate_fn=collate_fn,
             num_workers=self.config.dataloader_num_workers,
             pin_memory=(
                 self.config.dataloader_pin_memory
@@ -265,7 +315,7 @@ class AccelerateTrainer:
             drop_last=is_train,
         )
 
-    def _get_batch_size(self, is_train=True):
+    def _get_batch_size(self, is_train=True) -> int:
         """Get batch size for train/eval."""
         return (
             self.config.per_device_train_batch_size
@@ -273,7 +323,7 @@ class AccelerateTrainer:
             else self.config.per_device_eval_batch_size
         )
 
-    def _log_metrics(self, metrics: Dict[str, Any], step: int):
+    def _log_metrics(self, metrics: Dict[str, Any], step: int) -> None:
         """Log metrics to console and wandb."""
         # Console logging via accelerate (automatically handles main process)
         log_str = f"Step {step}: " + ", ".join(
@@ -283,16 +333,6 @@ class AccelerateTrainer:
 
         # Add GPU metrics if available
         if torch.cuda.is_available():
-            gpu_memory = torch.cuda.memory_allocated() / 1024**3  # GB
-            gpu_memory_cached = torch.cuda.memory_reserved() / 1024**3  # GB
-            metrics.update(
-                {
-                    "gpu_memory_allocated_gb": gpu_memory,
-                    "gpu_memory_cached_gb": gpu_memory_cached,
-                }
-            )
-
-            # Add GPU utilization if GPUtil is available
             if GPUTIL_AVAILABLE:
                 try:
                     gpus = GPUtil.getGPUs()
@@ -414,12 +454,13 @@ class AccelerateTrainer:
         # Training loop
         self.model.train()
         total_loss = 0
+        timer = Timer(alpha=0.1)
         start_time = time.time()
 
         for epoch in range(self.epoch, self.config.num_epochs):
             self.epoch = epoch
 
-            for step, batch in enumerate(self.train_dataloader):
+            for batch in self.train_dataloader:
 
                 with self.accelerator.accumulate(self.model):
 
@@ -427,12 +468,12 @@ class AccelerateTrainer:
                     with self.accelerator.autocast():
                         fwd_start = time.time()
                         loss, additional_metrics = self._compute_loss(batch)
-                        logger.info(f"Forward: {time.time() - fwd_start:.2f}s")
+                        timer.update_fwd(time.time() - fwd_start)
 
                     # Backward pass
                     bwd_start = time.time()
                     self.accelerator.backward(loss)
-                    logger.info(f"Backward: {time.time() - bwd_start:.2f}s")
+                    timer.update_bwd(time.time() - bwd_start)
 
                     # Gradient clipping
                     if self.config.max_grad_norm is not None:
@@ -446,7 +487,7 @@ class AccelerateTrainer:
                     self.optimizer.step()
                     self.lr_scheduler.step()
                     self.optimizer.zero_grad()
-                    torch.cuda.empty_cache()
+                    # torch.cuda.empty_cache()
 
                 # Accumulate loss (only log on accumulation boundary)
                 total_loss += loss.detach().float()
@@ -454,15 +495,16 @@ class AccelerateTrainer:
                 # Only log/save on accumulation boundaries
                 if self.accelerator.sync_gradients:
 
-                    if self.global_step % 10 == 0:
-                        allocated = torch.cuda.memory_allocated() / 1e9
-                        reserved = torch.cuda.memory_reserved() / 1e9
-                        logging.info(
-                            f"Step {step}: Allocated {allocated:.2f}GB, Reserved {reserved:.2f}GB"
-                        )
-
                     # Logging
                     if self.global_step % self.config.logging_steps == 0:
+
+                        allocated = torch.cuda.memory_allocated() / 1e9
+                        max_allocated = torch.cuda.max_memory_allocated() / 1e9
+                        reserved = torch.cuda.memory_reserved() / 1e9
+
+                        if self.global_step % 100 == 0:
+                            torch.cuda.reset_peak_memory_stats()
+
                         current_time = time.time()
                         elapsed = current_time - start_time
                         steps_per_sec = (
@@ -480,7 +522,12 @@ class AccelerateTrainer:
                                 if hasattr(grad_norm, "item")
                                 else grad_norm
                             ),
+                            "allocated_memory": allocated,
+                            "max_allocated_memory": max_allocated,
+                            "reserved_memory": reserved,
                             "steps_per_sec": steps_per_sec,
+                            "forward_time": timer.fwd_avg,
+                            "backward_time": timer.bwd_avg,
                             "epoch": epoch,
                             **additional_metrics,
                         }
@@ -516,7 +563,7 @@ class AccelerateTrainer:
 
                     # Save checkpoint
                     if (
-                        self.config.save_steps > 0
+                        self.global_step > 0
                         and self.global_step % self.config.save_steps == 0
                     ):
                         self.save_checkpoint(self.global_step)

@@ -2,7 +2,7 @@
 source .env
 
 # Configuration
-INSTANCE_TYPE=gpu_1x_h100_pcie #gpu_8x_a100_80gb_sxm4
+INSTANCE_TYPE=gpu_1x_h100_pcie #gpu_8x_a100_80gb_sxm4 
 SSH_NAME=scoobdoob
 SSH_PATH=~/.ssh/scoobdoob.pem
 GCS_BUCKET=energy-mpc
@@ -223,7 +223,8 @@ echo "🐍 Setting up Python environment with uv..."
 cd ~/${PROJECT_NAME}
 
 # Sync all dependencies (creates .venv and installs everything from pyproject.toml)
-uv sync
+uv sync 
+MAX_JOBS=$(nproc) uv pip install flash-attn --no-build-isolation
 
 # Set environment variables
 export GOOGLE_APPLICATION_CREDENTIALS="./servicekey.json"
@@ -232,30 +233,10 @@ export GCS_BUCKET=${GCS_BUCKET}
 export TOKENIZERS_PARALLELISM=false
 export WANDB_API_KEY=$WANDB_API_KEY
 
-echo "🔥 Starting training..."
-echo "GPU Info:"
-nvidia-smi
-
 echo "Python Info:"
 uv run python --version
 uv pip list | grep torch
-
-# Set up cloud authorizations.
-
-if [ -f "./servicekey.json" ]; then
-    echo "✅ Key file exists, size: $(wc -c < ./servicekey.json) bytes"
-else
-    echo "❌ Key file missing!"
-    ls -la
-    exit 1
-fi
-
-gcloud auth activate-service-account --key-file=./servicekey.json
-
-# Get dataset. 
-
-uv run python --version
-uv pip list | grep torch
+uv run python -c "import flash_attn; print(flash_attn.__version__)"
 
 # Set up cloud authorizations.
 
@@ -314,6 +295,10 @@ fi
 cd ~/${PROJECT_NAME}
 
 # Train.
+
+echo "🔥 Starting training..."
+echo "GPU Info:"
+nvidia-smi
 
 cd ~/${PROJECT_NAME}
 

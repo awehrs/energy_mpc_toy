@@ -3,11 +3,16 @@ from typing import Dict
 import torch
 import torch.nn as nn
 from einops import rearrange
-from mamba_ssm import Mamba2
 from jaxtyping import Bool, Float, Integer
 
 from models.attention import Attention, MLP
 from models.sensors import LanguageSensor
+
+
+try:
+    from mamba_ssm import Mamba2
+except ImportError:
+    mamba_ssm = None
 
 
 class ActionFusion(nn.Module):
@@ -138,7 +143,7 @@ class DynamicsModel(nn.Module):
 
         z = rearrange("(b n) t d -> (b t) n d", b=bsz)
 
-        z, h = self.dynamics_model(z)
+        z, h = self.layers(z)
 
         y = rearrange(z, "(b t) n d -> b n t d", b=bsz)
 

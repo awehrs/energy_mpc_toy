@@ -11,20 +11,22 @@ import datasets
 import hydra
 from omegaconf import DictConfig, OmegaConf
 from datasets import concatenate_datasets, load_dataset
-from einops import rearrange
+import numpy as np
+from pathlib import Path
+from typing import Callable, Dict, Optional, Union, List, Tuple
+
+import hydra
+import datasets
 import numpy as np
 import polars as pl
-import torch
-import torch.nn as nn
+from torch.utils.data import Dataset
+from omegaconf import DictConfig, OmegaConf
+from datasets import concatenate_datasets, load_dataset
+
+import polars as pl
 from torch.utils.data import Dataset
 
-from transformers import (
-    AutoConfig,
-    AutoModelForCausalLM,
-    AutoTokenizer,
-    PretrainedConfig,
-    GenerationConfig,
-)
+from transformers import AutoTokenizer
 
 
 logger = logging.getLogger(__name__)
@@ -36,12 +38,14 @@ class TrajectoryDataset(Dataset):
         self,
         config: DictConfig,
         data: datasets.Dataset,
+        stats: Dict,
         tokenizer: Callable,
     ):
         super().__init__()
 
         self.config = config
         self.data = data
+        self.stats = stats
         self.tokenizer = tokenizer
 
     def __getitem__(self, index):
@@ -81,7 +85,6 @@ class TrajectoryDataset(Dataset):
             src_column="actions",
             dst_columns={
                 "tokens": "action_tokens",
-                "mask": "action_attention_mask",
             },
         )
 
@@ -91,7 +94,6 @@ class TrajectoryDataset(Dataset):
             src_column="precepts",
             dst_columns={
                 "tokens": "precept_tokens",
-                "mask": "precept_attention_mask",
             },
         )
 
@@ -115,8 +117,11 @@ class TrajectoryDataset(Dataset):
             token_id=100,
         )
 
+        assert False
+
         dataset = cls.pad_and_mask(
             dataset,
+            pad=config.pad,
             src_column="action_tokens",
             dst_column="action_tokens_mask",
             max_length=config.max_action_len,
@@ -125,6 +130,7 @@ class TrajectoryDataset(Dataset):
 
         dataset = cls.pad_and_mask(
             dataset,
+            pad=config.pad,
             src_column="precept_tokens",
             dst_column="precept_tokens_mask",
             max_length=config.max_precept_len,
@@ -147,8 +153,18 @@ class TrajectoryDataset(Dataset):
             pad_token_id=tokenizer.pad_token_id,
         )
 
-        # Add actions column.
-        dataset = dataset.add_column("actions", column=len(dataset) * [[]])
+        dataset = dataset.remove_columns(["actions", "prepcets"])
+
+        dataset = dataset.flatten_indices()
+
+        stats = cls.get_stats(dataset)
+
+        cls(
+            config=config,
+            data=dataset,
+            stats=stats,
+            tokenizer=tokenizer,
+        )
 
     @staticmethod
     def download_datasets(
@@ -430,7 +446,7 @@ class TrajectoryDataset(Dataset):
         dataset: datasets.Dataset,
         column: str,
         length: int,
-        token_id: int,
+        null_token_id: int,
     ) -> datasets.Dataset:
 
         os.makedirs("temp_df", exist_ok=True)
@@ -440,7 +456,7 @@ class TrajectoryDataset(Dataset):
             .lazy()
             .with_columns(
                 pl.when(pl.col(column).list.len() == 0)
-                .then(length * [token_id])
+                .then(length * [null_token_id])
                 .otherwise(pl.col(column))
                 .name.keep()
             )
@@ -460,6 +476,7 @@ class TrajectoryDataset(Dataset):
     @staticmethod
     def pad_and_mask(
         dataset: datasets.Dataset,
+        pad: bool,
         src_column: str,
         dst_column: str,
         max_length: int,
@@ -467,19 +484,26 @@ class TrajectoryDataset(Dataset):
     ) -> datasets.Dataset:
 
         def _pad_and_mask(examples):
+            lengths = []
             input_ids = []
             attention_masks = []
 
             for tokens in examples[src_column]:
 
                 length = len(tokens)
-                input_ids.append(tokens + [pad_token_id] * (max_length - length))
-                attention_masks.append([1] * length + [0] * (max_length - length))
+                lengths.append(length)
+
+                if pad:
+                    input_ids.append(tokens + [pad_token_id] * (max_length - length))
+                    attention_masks.append([1] * length + [0] * (max_length - length))
+                else:
+                    input_ids.append(tokens)
+                    attention_masks.append([1])
 
             return {
                 src_column: input_ids,
                 dst_column: attention_masks,
-                src_column + "_length": [sum(mask) for mask in attention_masks],
+                src_column + "_length": lengths,
             }
 
         return dataset.map(
@@ -504,7 +528,10 @@ class TrajectoryDataset(Dataset):
                 maintain_order=True,
             )
             .agg(pl.all())
-            .with_columns(pl.col("num_steps").list.first())
+            .with_columns(
+                pl.col("num_steps").list.first(),
+                pl.col("action_tokens_length").list.sum(),
+            )
             .sink_parquet("temp_flattened/flat_trajectory.parquet")
         )
 
@@ -554,14 +581,48 @@ class TrajectoryDataset(Dataset):
             desc=f"Padding trajectories for {column}...",
         )
 
-    def calculate_stats():
+    @classmethod
+    def get_stats(dataset: datasets.Dataset) -> datasets.Dataset:
         pass
 
-    def save(self):
-        pass
+    def save(self, tgt_dir: Union[str, Path]) -> None:
+        tgt_dir = Path(tgt_dir)
+        tgt_dir.mkdir(parents=True, exist_ok=True)
 
-    def load(self):
-        pass
+        # Save config.
+        with open(tgt_dir / "config.yaml", "w") as f:
+            OmegaConf.save(self.config, f)
+
+        # Save data
+        self.data.save_to_disk(str(tgt_dir / "data"))
+
+        # Save stats.
+        with open(tgt_dir / "stats.json", "w") as f:
+            json.dump(self.stats, f)
+
+    @classmethod
+    def load(cls, src_dir: Union[str, Path]) -> "TrajectoryDataset":
+        src_dir = Path(src_dir)
+
+        # Load config
+        with open(src_dir / "config.yaml", "r") as f:
+            config = OmegaConf.load(f)
+
+        # Load data
+        data = datasets.load_from_disk(str(src_dir / "data"))
+
+        # Load stats.
+        with open(src_dir / "stats.json", "r") as f:
+            stats = json.load(f)
+
+        tokenizer = AutoTokenizer.from_pretrained(config.model_name)
+
+        return cls(
+            data=data,
+            config=config,
+            stats=stats,
+            tokenizer=tokenizer,
+        )
 
 
 script_dir = Path(__file__).parent

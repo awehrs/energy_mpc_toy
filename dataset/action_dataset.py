@@ -4,14 +4,14 @@ import logging
 from pathlib import Path
 from typing import Callable, Dict, Union, List
 
-import datasets
-from datasets import concatenate_datasets, load_dataset
 import hydra
 import numpy as np
-from omegaconf import DictConfig, OmegaConf
 import polars as pl
+import datasets
 from torch.utils.data import Dataset
 from transformers import AutoTokenizer
+from omegaconf import DictConfig, OmegaConf
+from datasets import concatenate_datasets, load_dataset
 
 
 logger = logging.getLogger(__name__)
@@ -19,10 +19,17 @@ logger = logging.getLogger(__name__)
 
 class ActionDataset(Dataset):
 
-    def __init__(self, config: DictConfig, data: datasets.Dataset, tokenizer: Callable):
+    def __init__(
+        self,
+        config: DictConfig,
+        data: datasets.Dataset,
+        stats: Dict,
+        tokenizer: Callable,
+    ):
         super().__init__()
         self.config = config
         self.data = data
+        self.stats = stats
         self.tokenizer = tokenizer
 
     def __getitem__(self, index):
@@ -50,6 +57,9 @@ class ActionDataset(Dataset):
             else:
                 raise ValueError("Tokenizer must have pad token")
 
+        if tokenizer.bos_token_id is None:
+            raise ValueError("Tokenizer must have bos token")
+
         datasets = cls.download_datasets(
             dataset_names=config.dataset_names,
             debug=config.debug,
@@ -76,26 +86,29 @@ class ActionDataset(Dataset):
 
         dataset = cls.pad_and_mask(
             dataset,
+            pad=config.pad,
             max_length=config.max_action_len,
             pad_token_id=tokenizer.pad_token_id,
         )
 
         dataset = cls.create_null_sequences(
             dataset,
+            pad=config.pad,
             max_len=config.max_action_len,
             null_ratio=config.null_ratio,
             null_token_id=tokenizer.pad_token_id,
+            bos_token_id=tokenizer.bos_token_id,
+            eos_token_id=tokenizer.eos_token_id,
         )
 
         dataset = dataset.flatten_indices()
 
-        dataset.set_format(type="torch", columns=["action_tokens", "attention_mask"])
-
-        dataset = dataset.shuffle(seed=42)
+        stats = cls.get_stats(dataset)
 
         return cls(
             config=config,
             data=dataset,
+            stats=stats,
             tokenizer=tokenizer,
         )
 
@@ -151,8 +164,21 @@ class ActionDataset(Dataset):
             for idx, msg_trace in enumerate(messages):
                 for msg in msg_trace:
                     if msg["role"] == "assistant":
-                        actions.append(msg["content"])
-                        ids.append(examples["uuid"][idx])
+
+                        if msg["content"] != "":
+                            assert "function_call" not in msg
+                            actions.append(msg["content"])
+                            ids.append(examples["uuid"][idx])
+                        elif "function_call" in msg:
+                            func_name = msg["function_call"]["name"]
+                            func_args = msg["function_call"]["arguments"]
+                            actions.append(
+                                f'{{"name": "{func_name}", "arguments": {func_args}}}'
+                            )
+                            ids.append(examples["uuid"][idx])
+                        elif "reasoning_content" in msg:
+                            # Don't use non-latent reasoning.
+                            pass
 
             examples["actions"] = actions
             examples["id"] = ids
@@ -200,7 +226,7 @@ class ActionDataset(Dataset):
 
             tokenized = tokenizer(
                 examples[src_column],
-                add_special_tokens=False,
+                add_special_tokens=True,
                 **kwargs,
             )
 
@@ -258,24 +284,32 @@ class ActionDataset(Dataset):
     @staticmethod
     def pad_and_mask(
         dataset: datasets.Dataset,
+        pad: bool,
         max_length: int,
         pad_token_id: int,
     ) -> datasets.Dataset:
 
         def _pad_and_mask(examples):
+            lengths = []
             input_ids = []
             attention_masks = []
 
             for tokens in examples["action_tokens"]:
 
                 length = len(tokens)
-                input_ids.append(tokens + [pad_token_id] * (max_length - length))
-                attention_masks.append([1] * length + [0] * (max_length - length))
+                lengths.append(length)
+
+                if pad:
+                    input_ids.append(tokens + [pad_token_id] * (max_length - length))
+                    attention_masks.append([1] * length + [0] * (max_length - length))
+                else:
+                    input_ids.append(tokens)
+                    attention_masks.append([1])
 
             return {
                 "action_tokens": input_ids,
                 "attention_mask": attention_masks,
-                "token_length": [sum(mask) for mask in attention_masks],
+                "token_length": lengths,
             }
 
         return dataset.map(
@@ -290,22 +324,32 @@ class ActionDataset(Dataset):
     @staticmethod
     def create_null_sequences(
         dataset: datasets.Dataset,
+        pad: bool,
         max_len: int,
         null_ratio: float,
         null_token_id: int,
+        bos_token_id: int,
+        eos_token_id: int,
     ) -> datasets.Dataset:
 
         logging.info("Creating null sequences...")
 
         num_nulls = int(null_ratio * len(dataset))
 
+        num_tokens = max_len if pad else 3  # [BOS, PAD, EOS]
+
         null_data = {
             "id": [""] * num_nulls,
             "actions": [""] * num_nulls,
-            "action_tokens": [[null_token_id] * max_len] * num_nulls,
-            "attention_mask": [[1] * max_len] * num_nulls,
-            "token_length": [0] * num_nulls,
+            "action_tokens": [
+                [bos_token_id] + ((num_tokens - 2) * [null_token_id]) + [eos_token_id]
+            ],
+            "attention_mask": [[1] * num_tokens] * num_nulls,
+            "token_length": [num_tokens] * num_nulls,
         }
+
+        if "attention_mask" not in dataset.features:
+            null_data.pop("attention_mask")
 
         null_dataset = datasets.Dataset.from_dict(
             null_data,
@@ -314,9 +358,10 @@ class ActionDataset(Dataset):
 
         return concatenate_datasets([dataset, null_dataset])
 
-    def get_stats(self) -> Dict:
+    @staticmethod
+    def get_stats(dataset: datasets.Dataset) -> Dict[str, float]:
 
-        token_lengths = np.array(self.data["token_length"])
+        token_lengths = np.array(dataset["token_length"])
 
         # Exclude null sequences
         token_lengths = token_lengths[token_lengths > 0]
@@ -346,6 +391,10 @@ class ActionDataset(Dataset):
         # Save data
         self.data.save_to_disk(str(tgt_dir / "data"))
 
+        # Save stats.
+        with open(tgt_dir / "stats.json", "w") as f:
+            json.dump(self.stats, f)
+
     @classmethod
     def load(cls, src_dir: Union[str, Path]) -> "ActionDataset":
         src_dir = Path(src_dir)
@@ -357,11 +406,16 @@ class ActionDataset(Dataset):
         # Load data
         data = datasets.load_from_disk(str(src_dir / "data"))
 
+        # Load stats.
+        with open(src_dir / "stats.json", "r") as f:
+            stats = json.load(f)
+
         tokenizer = AutoTokenizer.from_pretrained(config.model_name)
 
         return cls(
             data=data,
             config=config,
+            stats=stats,
             tokenizer=tokenizer,
         )
 
@@ -383,6 +437,7 @@ def main(cfg: DictConfig):
     OmegaConf.resolve(cfg)
 
     dataset = ActionDataset.build_dataset(config=cfg.dataset)
+
     dataset.save(
         tgt_dir=Path(
             cfg.training.cache_dir,

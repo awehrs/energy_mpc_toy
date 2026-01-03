@@ -8,7 +8,7 @@ hydra:
 # Main configuration file with defaults
 defaults:
   - model: default
-  - dataset: default
+  - dataset: default 
   - training: default
   - accelerate: single
   - _self_ 
