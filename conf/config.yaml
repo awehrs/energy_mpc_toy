@@ -18,10 +18,9 @@ defaults:
 dropout: 0.1
 d_latent: 768
 d_latent_debug: 256
-pretrained_lm: Qwen/Qwen2.5-Coder-0.5B-Instruct #Qwen/Qwen2.5-Coder-1.5B-Instruct
-pretrained_lm_debug: gpt2
-max_action_len: 2048
-max_precept_len: 2048
+pretrained_lm: Qwen/Qwen2.5-Coder-0.5B-Instruct 
+max_action_len: 1024
+max_precept_len: 1024
 n_self_attn_heads: 8
 n_cross_attn_heads: 8
 

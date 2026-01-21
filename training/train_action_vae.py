@@ -22,7 +22,9 @@ class SequencePackedCollator(DataCollatorWithFlattening):
     def __init__(
         self,
         n_latents: int = 64,
+        max_action_len: int = 2048,
         return_position_ids: bool = True,
+        pad_token_id: int = None,
         separator_id: int = -100,
         return_flash_attn_kwargs: bool = True,
         return_seq_idx: bool = False,
@@ -36,6 +38,8 @@ class SequencePackedCollator(DataCollatorWithFlattening):
             return_tensors=return_tensors,
         )
         self.n_latents = n_latents
+        self.pad_token_id = pad_token_id
+        self.max_action_len = max_action_len
 
     def __call__(
         self,
@@ -43,94 +47,149 @@ class SequencePackedCollator(DataCollatorWithFlattening):
         return_tensors: bool = None,
         separator_id: int = None,
     ):
-
         batch = super().__call__(features, return_tensors, separator_id)
+
+        data = self._create_decoder_packed_data(cu_seqlens=batch["cu_seq_lens_q"])
+        batch.update(data)
 
         batch["input_ids"] = batch["input_ids"].squeeze(0)
         batch["position_ids"] = batch["position_ids"].squeeze(0)
-
-        batch["adjusted_position_ids"] = self._adjust_position_ids(
-            cu_seq_lens=batch["cu_seq_lens_q"],
-        )
-
-        batch["latent_indices"], batch["token_indices"] = (
-            self._compute_interleave_indices(
-                cu_seq_lens=batch["cu_seq_lens_q"],
-            )
-        )
-
         batch["max_seq_len_k"] = batch["max_length_k"]
 
-        batch.pop("labels")
         batch.pop("max_length_q")
         batch.pop("max_length_k")
 
+        batch_size = len(batch["cu_seq_lens_q"]) - 1
+
+        logging.info(f"Num examples: {batch_size}")
+
         return batch
 
-    def _adjust_position_ids(
+    def _create_decoder_packed_data(
         self,
-        cu_seq_lens: torch.Tensor,
-    ) -> torch.Tensor:
+        cu_seqlens: torch.Tensor,
+    ) -> Dict[str, torch.Tensor]:
+        """Create packed padding and position IDs for decoder"""
 
-        position_ids = []
+        batch_size = len(cu_seqlens) - 1
 
-        for i in range(len(cu_seq_lens) - 1):
-            seq_len = cu_seq_lens[i + 1] - cu_seq_lens[i]
-
-            position_ids.append(
-                torch.arange(0, self.n_latents + seq_len, dtype=torch.long)
-            )
-
-        return torch.cat(position_ids, dim=0)
-
-    def _compute_interleave_indices(self, cu_seq_lens: torch.Tensor):
-        """
-        Compute indices for vectorized interleaving of latents and tokens.
-
-        Returns:
-            latent_indices: [batch_size * n_latents] - where to place latents
-            token_indices: [total_tokens] - where to place tokens
-        """
-        batch_size = len(cu_seq_lens) - 1
-
+        all_decoder_position_ids = []
         latent_indices = []
-        token_indices = []
-        current_pos = 0
+        padding_indices = []
+        decoder_cu_seqlens = [0]
+        current_global_idx = 0
 
         for i in range(batch_size):
-            # Latents first
-            latent_indices.extend(range(current_pos, current_pos + self.n_latents))
-            current_pos += self.n_latents
+            start = cu_seqlens[i].item()
+            end = cu_seqlens[i + 1].item()
+            seq_len = end - start
+            pad_len = min(seq_len, self.max_action_len)
 
-            # Then tokens
-            num_tokens = (cu_seq_lens[i + 1] - cu_seq_lens[i]).item()
-            token_indices.extend(range(current_pos, current_pos + num_tokens))
-            current_pos += num_tokens
+            total_seq_len = self.n_latents + pad_len
 
-        return (
-            torch.tensor(latent_indices, dtype=torch.long),
-            torch.tensor(token_indices, dtype=torch.long),
-        )
+            pos_ids = torch.arange(0, total_seq_len, dtype=torch.long)
+            all_decoder_position_ids.append(pos_ids)
+
+            latent_indices.extend(
+                range(current_global_idx, current_global_idx + self.n_latents)
+            )
+            padding_start = current_global_idx + self.n_latents
+            padding_end = current_global_idx + total_seq_len
+            padding_indices.extend(range(padding_start, padding_end))
+
+            current_global_idx += total_seq_len
+            decoder_cu_seqlens.append(current_global_idx)
+
+        return {
+            "latent_indices": torch.tensor(latent_indices, dtype=torch.long),
+            "padding_indices": torch.tensor(padding_indices, dtype=torch.long),
+            "decoder_position_ids": torch.cat(all_decoder_position_ids),
+        }
+
+    def unpack_and_pad_targets(
+        self,
+        targets: torch.Tensor,
+        cu_seqlens: torch.Tensor,
+        max_length: int,
+        pad_token_id: int,
+    ) -> torch.Tensor:
+        """Unpack targets and pad each sequence to max_length"""
+
+        packed_targets = targets.squeeze(0)
+        batch_size = len(cu_seqlens) - 1
+
+        padded_list = []
+
+        for i in range(batch_size):
+            start = cu_seqlens[i].item()
+            end = cu_seqlens[i + 1].item()
+            seq = packed_targets[start:end]
+
+            padding = torch.full(
+                (max_length - len(seq),),
+                pad_token_id,
+                dtype=seq.dtype,
+                device=seq.device,
+            )
+            seq = torch.cat([seq, padding])
+
+            padded_list.append(seq)
+
+        return torch.stack(padded_list)
 
 
 class PackedBatchSampler:
+
     def __init__(
         self,
         dataset: torch.utils.data.Dataset,
         max_tokens: int = 16384,
+        shuffle: bool = True,
+        seed: int = 0,
     ):
         self.dataset = dataset
         self.max_tokens = max_tokens
+        self.shuffle = shuffle
+        self.seed = seed
+
+        # Get distributed info
+        self.num_replicas = int(os.environ.get("WORLD_SIZE", 1))
+        self.rank = int(os.environ.get("RANK", 0))
+        self.epoch = 0
+
+        # Handle Subset vs regular dataset
+        if isinstance(dataset, torch.utils.data.Subset):
+            actual_dataset = dataset.dataset
+            self.subset_indices = list(dataset.indices)
+            all_lengths = list(actual_dataset.data["token_length"])
+            self.seq_lengths = [all_lengths[i] for i in self.subset_indices]
+        else:
+            self.subset_indices = None
+            self.seq_lengths = list(dataset.data["token_length"])
 
     def __iter__(self):
+
+        # Shuffle indices
+        if self.shuffle:
+            g = torch.Generator()
+            g.manual_seed(self.seed + self.epoch)
+            indices = torch.randperm(len(self.seq_lengths), generator=g).tolist()
+            assert all(
+                0 <= idx < len(self.seq_lengths) for idx in indices
+            ), f"Shuffle created invalid indices! Max: {max(indices)}, len(seq_lengths): {len(self.seq_lengths)}"
+        else:
+            indices = list(range(len(self.seq_lengths)))
+
+        # Pack sequences into batches
+        all_batches = []
         current_batch = []
         current_tokens = 0
 
-        for idx in range(len(self.dataset)):
-            seq_len = len(self.dataset[idx]["input_ids"])
+        for idx in indices:
+            seq_len = self.seq_lengths[idx]
 
             if current_tokens + seq_len > self.max_tokens and current_batch:
-                yield current_batch
+                all_batches.append(current_batch)
                 current_batch = []
                 current_tokens = 0
 
@@ -138,7 +197,30 @@ class PackedBatchSampler:
             current_tokens += seq_len
 
         if current_batch:
-            yield current_batch
+            all_batches.append(current_batch)
+
+        # Split batches across GPUs
+        batches_per_replica = len(all_batches) // self.num_replicas
+        start_idx = self.rank * batches_per_replica
+        end_idx = (
+            start_idx + batches_per_replica
+            if self.rank < self.num_replicas - 1
+            else len(all_batches)
+        )
+
+        # Yield batches, mapping back to original indices if needed
+        for batch in all_batches[start_idx:end_idx]:
+            yield batch
+
+    def __len__(self):
+        # Estimate number of batches
+        avg_seq_len = sum(self.seq_lengths) / len(self.seq_lengths)
+        estimated_batches = (len(self.seq_lengths) * avg_seq_len) // self.max_tokens
+        return int(estimated_batches // self.num_replicas)
+
+    def set_epoch(self, epoch):
+        """Call this at the start of each epoch for proper shuffling"""
+        self.epoch = epoch
 
 
 class VAETrainer(AccelerateTrainer):
@@ -149,7 +231,8 @@ class VAETrainer(AccelerateTrainer):
         train_dataset: torch.utils.data.Dataset,
         eval_dataset: Optional[torch.utils.data.Dataset] = None,
         data_collate_fn: Optional[DataCollatorWithFlattening] = None,
-        batch_sampler: Optional[Callable] = None,
+        eval_batch_sampler: Optional[Callable] = None,
+        train_batch_sampler: Optional[Callable] = None,
         eval_fn: Optional[Callable] = None,
         tokenizer: Optional[Callable] = None,
     ):
@@ -160,7 +243,8 @@ class VAETrainer(AccelerateTrainer):
             train_dataset=train_dataset,
             eval_dataset=eval_dataset,
             collate_fn=data_collate_fn,
-            batch_sampler=batch_sampler,
+            eval_batch_sampler=eval_batch_sampler,
+            train_batch_sampler=train_batch_sampler,
             eval_fn=eval_fn,
             tokenizer=tokenizer,
         )
@@ -200,84 +284,49 @@ class VAETrainer(AccelerateTrainer):
         if self.data_collate_fn is not None:
             # Sequence packed
             position_ids = batch["position_ids"]
-            adjusted_position_ids = batch["adjusted_position_ids"]
-            latent_indices = batch["latent_indices"]
-            token_indices = batch["token_indices"]
             max_seq_len_k = batch["max_seq_len_k"]
             cu_seq_lens_k = batch["cu_seq_lens_k"]
+            latent_indices = batch["latent_indices"]
+            padding_indices = batch["padding_indices"]
+            decoder_position_ids = batch["decoder_position_ids"]
 
-            outputs = self.model(
-                input_ids=input_ids,
-                max_seq_len=max_seq_len_k,
-                cu_seq_lens=cu_seq_lens_k,
-                token_indices=token_indices,
-                latent_indices=latent_indices,
-                position_ids=position_ids,
-                adjusted_position_ids=adjusted_position_ids,
-            )
+            with self.accelerator.autocast():
 
-            logits = outputs["logits"]
+                outputs = self.model(
+                    input_ids=input_ids,
+                    max_seq_len=max_seq_len_k,
+                    cu_seq_lens=cu_seq_lens_k,
+                    position_ids=position_ids,
+                    latent_indices=latent_indices,
+                    padding_indices=padding_indices,
+                    decoder_position_ids=decoder_position_ids,
+                    targets=batch["labels"],
+                )
 
-            targets = input_ids
+                recon_loss = outputs["loss"]
 
-            mask = targets != self.data_collate_fn.separator_id
-
-            recon_loss = F.cross_entropy(logits[mask], targets[mask], reduction="mean")
-
-            kl_per_dim = -0.5 * (
-                1 + outputs["log_var"] - outputs["mean"] ** 2 - outputs["log_var"].exp()
-            )  # [total_latents, d_latent]
-
-            # Sum over latent dimensions
-            kl_per_latent = kl_per_dim.sum(dim=-1)  # [total_latents]
-
-            # Reshape from packed to batched [batch_size, n_latents]
-            total_latents = kl_per_latent.shape[0]
-            n_latents = self.model.n_latents
-            batch_size = total_latents // n_latents
-            kl_per_latent = kl_per_latent.view(batch_size, n_latents)
-
-            # Apply free bits per latent
-            kl_per_latent = torch.max(
-                kl_per_latent, torch.tensor(self.free_bits, device=kl_per_latent.device)
-            )
-
-            # Sum over latents per sequence, mean over batch
-            kl_loss = kl_per_latent.mean()
         else:
             # Batched
             attention_mask = batch["attention_mask"]
 
             outputs = self.model(input_ids=input_ids, attn_mask=attention_mask)
 
-            logits = outputs["logits"]  # [batch, seq_len, vocab_size]
-            targets = input_ids  # [batch, seq_len]
+            raise NotImplementedError
 
-            vocab_size = logits.shape[-1]
+        kl_per_dim = -0.5 * (
+            1 + outputs["log_var"] - outputs["mean"] ** 2 - outputs["log_var"].exp()
+        )  # [batch, n_latents, d_latent]
 
-            # Flatten for loss computation
-            logits_flat = logits.reshape(-1, vocab_size)
-            targets_flat = targets.reshape(-1)
-            mask = targets_flat != self.tokenizer.pad_token_id
+        # Sum over latent dimensions
+        kl_per_latent = kl_per_dim.sum(dim=-1)  # [batch, n_latents]
 
-            recon_loss = F.cross_entropy(
-                logits_flat[mask], targets_flat[mask], reduction="mean"
-            )
+        # Apply free bits per latent
+        kl_per_latent = torch.max(
+            kl_per_latent, torch.tensor(self.free_bits, device=kl_per_latent.device)
+        )  # [batch, n_latents]
 
-            kl_per_dim = -0.5 * (
-                1 + outputs["log_var"] - outputs["mean"] ** 2 - outputs["log_var"].exp()
-            )  # [batch, n_latents, d_latent]
-
-            # Sum over latent dimensions
-            kl_per_latent = kl_per_dim.sum(dim=-1)  # [batch, n_latents]
-
-            # Apply free bits per latent
-            kl_per_latent = torch.max(
-                kl_per_latent, torch.tensor(self.free_bits, device=kl_per_latent.device)
-            )  # [batch, n_latents]
-
-            # Sum over latents per sequence, mean over batch
-            kl_loss = kl_per_latent.mean()
+        # Sum over latents per sequence, mean over batch
+        kl_loss = kl_per_latent.mean()
 
         # Anneal KL weight
         kl_weight = self.get_kl_weight()
@@ -386,7 +435,7 @@ def main(cfg: DictConfig):
 
     # dl = torch.utils.data.DataLoader(
     #     dataset,
-    #     collate_fn=SequencePackedCollator(),
+    #     collate_fn=SequencePackedCollator(pad_token_id=dataset.tokenizer.pad_token_id),
     #     batch_size=4,
     # )
 
@@ -423,6 +472,9 @@ def main(cfg: DictConfig):
         model_name=model_cfg.model_name,
         d_latent=model_cfg.d_latent,
         n_latents=model_cfg.n_action_latents,
+        vocab_size=len(dataset.tokenizer),
+        pad_token_id=dataset.tokenizer.pad_token_id,
+        max_action_len=model_cfg.max_action_len,
         n_self_attn_heads=model_cfg.n_self_attn_heads,
         n_cross_attn_heads=model_cfg.n_cross_attn_heads,
         n_encoder_self_attn_layers=model_cfg.n_encoder_self_attn_layers,
@@ -430,14 +482,20 @@ def main(cfg: DictConfig):
         dropout=model_cfg.dropout,
     ).to(torch.bfloat16)
 
-    # datacollator = SequencePackedCollator(
-    #     n_latents=cfg.model.action_model.n_action_latents, return_flash_attn_kwargs=True
-    # )
+    datacollator = SequencePackedCollator(
+        n_latents=cfg.model.action_model.n_action_latents,
+        max_action_len=cfg.max_action_len,
+        pad_token_id=dataset.tokenizer.pad_token_id,
+        return_flash_attn_kwargs=True,
+    )
 
-    # sampler = PackedBatchSampler(dataset, max_tokens=cfg.training.max_tokens_per_batch)
+    eval_batch_sampler = PackedBatchSampler(
+        eval_dataset, max_tokens=cfg.training.max_tokens_per_batch
+    )
 
-    datacollator = None
-    batch_sampler = None
+    train_batch_sampler = PackedBatchSampler(
+        train_dataset, max_tokens=cfg.training.max_tokens_per_batch
+    )
 
     trainer = VAETrainer(
         model=model,
@@ -445,6 +503,8 @@ def main(cfg: DictConfig):
         train_dataset=train_dataset,
         eval_dataset=eval_dataset,
         data_collate_fn=datacollator,
+        eval_batch_sampler=eval_batch_sampler,
+        train_batch_sampler=train_batch_sampler,
         tokenizer=dataset.tokenizer,
     )
 

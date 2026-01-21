@@ -131,9 +131,11 @@ class DynamicsTrainer(AccelerateTrainer):
         action_latents = mean + sigma * epsilon
 
         # Forward pass.
-        outputs = self.model(input_ids, attention_mask, action_latents)["output"][
-            :, :-1, :
-        ]
+        state_updated = self.model.update_state(input_ids, attention_mask)
+
+        outputs = self.model.predict(input_ids, attention_mask, action_latents)[
+            "output"
+        ][:, :-1, :]
 
         targets = self.ema_encoder(input_ids, attention_mask)[:, 1:, :]
 

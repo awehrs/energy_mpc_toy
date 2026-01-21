@@ -5,9 +5,9 @@ from pathlib import Path
 from typing import Callable, Dict, Union, List
 
 import hydra
+import datasets
 import numpy as np
 import polars as pl
-import datasets
 from torch.utils.data import Dataset
 from transformers import AutoTokenizer
 from omegaconf import DictConfig, OmegaConf
@@ -57,9 +57,6 @@ class ActionDataset(Dataset):
             else:
                 raise ValueError("Tokenizer must have pad token")
 
-        if tokenizer.bos_token_id is None:
-            raise ValueError("Tokenizer must have bos token")
-
         datasets = cls.download_datasets(
             dataset_names=config.dataset_names,
             debug=config.debug,
@@ -96,8 +93,7 @@ class ActionDataset(Dataset):
             pad=config.pad,
             max_len=config.max_action_len,
             null_ratio=config.null_ratio,
-            null_token_id=tokenizer.pad_token_id,
-            bos_token_id=tokenizer.bos_token_id,
+            null_token_id=tokenizer.encode("~", add_special_tokens=False)[0],
             eos_token_id=tokenizer.eos_token_id,
         )
 
@@ -328,7 +324,6 @@ class ActionDataset(Dataset):
         max_len: int,
         null_ratio: float,
         null_token_id: int,
-        bos_token_id: int,
         eos_token_id: int,
     ) -> datasets.Dataset:
 
@@ -336,14 +331,13 @@ class ActionDataset(Dataset):
 
         num_nulls = int(null_ratio * len(dataset))
 
-        num_tokens = max_len if pad else 3  # [BOS, PAD, EOS]
+        num_tokens = max_len if pad else 2  # [PAD, EOS]
 
         null_data = {
             "id": [""] * num_nulls,
             "actions": [""] * num_nulls,
-            "action_tokens": [
-                [bos_token_id] + ((num_tokens - 2) * [null_token_id]) + [eos_token_id]
-            ],
+            "action_tokens": [(num_tokens - 2) * [null_token_id] + [eos_token_id]]
+            * num_nulls,
             "attention_mask": [[1] * num_tokens] * num_nulls,
             "token_length": [num_tokens] * num_nulls,
         }
@@ -395,6 +389,9 @@ class ActionDataset(Dataset):
         with open(tgt_dir / "stats.json", "w") as f:
             json.dump(self.stats, f)
 
+        # Save tokenizer.
+        self.tokenizer.save_pretrained(tgt_dir / "tokenizer")
+
     @classmethod
     def load(cls, src_dir: Union[str, Path]) -> "ActionDataset":
         src_dir = Path(src_dir)
@@ -410,7 +407,8 @@ class ActionDataset(Dataset):
         with open(src_dir / "stats.json", "r") as f:
             stats = json.load(f)
 
-        tokenizer = AutoTokenizer.from_pretrained(config.model_name)
+        # Load tokenizer.
+        tokenizer = AutoTokenizer.from_pretrained(src_dir / "tokenizer")
 
         return cls(
             data=data,

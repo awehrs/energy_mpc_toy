@@ -2,10 +2,12 @@ from typing import Optional
 
 import torch
 import torch.nn as nn
-from jaxtyping import Int64, Float
+from jaxtyping import Float
 from transformers import AutoConfig, AutoModelForCausalLM
 
 from models.attention import TransformerBlock
+
+import logging
 
 
 class LanguageActuator(nn.Module):
@@ -18,6 +20,9 @@ class LanguageActuator(nn.Module):
         model_name: str,
         n_latents: int = 64,
         latent_dim: int = 768,
+        vocab_size: int = 151666,
+        pad_token_id: int = -100,
+        max_action_len: int = 1024,
         n_self_attn_layers: int = 6,
         n_self_attn_heads: int = 8,
         dropout: int = 0.1,
@@ -25,6 +30,8 @@ class LanguageActuator(nn.Module):
         super().__init__()
 
         self.n_latents = n_latents
+        self.pad_token_id = pad_token_id
+        self.max_action_len = max_action_len
 
         # Extract decoder configuration
         self.config = AutoConfig.from_pretrained(model_name)
@@ -54,19 +61,18 @@ class LanguageActuator(nn.Module):
             attn_implementation="flash_attention_2",
         )
 
-        # Freeze all decoder parameters
+        self.decoder.gradient_checkpointing_enable()
+
+        # Freeze all decoder parameters except for resized token embedding.
         for param in self.decoder.parameters():
             param.requires_grad = False
 
     def forward(
         self,
         latent: torch.Tensor,
-        target_tokens: torch.Tensor,
-        token_indices: Optional[Int64[torch.Tensor, "total_batch_tokens"]] = None,
-        latent_indices: Optional[Int64[torch.Tensor, "total_batch_latents"]] = None,
-        position_ids: Optional[
-            Int64[torch.Tensor, "total_batch_tokens_and_latents"]
-        ] = None,
+        position_ids: Optional[torch.Tensor] = None,
+        latent_indices: Optional[torch.Tensor] = None,
+        padding_indices: Optional[torch.Tensor] = None,
     ) -> Float[torch.Tensor, "batch seq_len vocab_size"]:
 
         if len(latent.shape) == 2:
@@ -88,34 +94,54 @@ class LanguageActuator(nn.Module):
             )
 
             latent_embed = self.projection(attn_out)
-            tokens_embed = self.decoder.get_input_embeddings()(target_tokens)
 
-            total_len = len(latent_indices) + len(token_indices)
-            dim = tokens_embed.shape[-1]
-            combined_embed = torch.zeros(
-                total_len, dim, device=tokens_embed.device, dtype=tokens_embed.dtype
+            total_positions = position_ids.shape[0]
+
+            dim = latent_embed.shape[-1]
+
+            combined = torch.empty(
+                (total_positions, dim),
+                dtype=latent_embed.dtype,
+                device=latent_embed.device,
             )
-            combined_embed.index_copy_(0, latent_indices, latent_embed)
-            combined_embed.index_copy_(0, token_indices, tokens_embed)
+
+            combined[latent_indices] = latent_embed
+
+            padding_embeds = self.decoder.get_input_embeddings()(
+                torch.full(
+                    (len(padding_indices),),
+                    self.pad_token_id,
+                    dtype=torch.long,
+                    device=latent.device,
+                )
+            )
+            combined[padding_indices] = padding_embeds
 
             logits = self.decoder(
-                inputs_embeds=combined_embed.unsqueeze(0),
+                inputs_embeds=combined.unsqueeze(0),
                 position_ids=position_ids.unsqueeze(0),
-            ).logits.squeeze(0)[token_indices]
+            ).logits.squeeze(0)
 
+            logits = logits[padding_indices]
         else:
             # Batched sequence
             attn_out = self.self_attention_layers(q=latent)
 
             latent_embed = self.projection(attn_out)
-            tokens_embed = self.decoder.get_input_embeddings()(target_tokens)
 
-            combined_embed = torch.cat([latent_embed, tokens_embed], dim=1)
-            n_latents = latent.shape[1]
+            batch_size, _, dim = latent_embed.shape
+
+            padding = torch.full(
+                size=(batch_size, self.max_action_len, dim),
+                fill_value=self.pad_token_id,
+                device=latent_embed.device,
+            )
+
+            latent_embed = torch.cat([latent_embed, padding], dim=1)
 
             logits = self.decoder(
-                inputs_embeds=combined_embed,
-            ).logits[:, n_latents:, :]
+                inputs_embeds=latent_embed,
+            ).logits[:, self.n_latents :, :]
 
         return logits
 

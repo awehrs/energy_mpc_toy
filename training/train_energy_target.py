@@ -30,6 +30,12 @@
 
 # next precept = dynamics model (current precept, action latent)
 
+# decomposition:
+
+# S_t = f(X_t, S_t-1)
+
+# X_t+1_pred = g(S_t, A_t)
+
 # subsample k time steps in trajectory
 
 # for each subsampled step
@@ -49,18 +55,6 @@
 # average over n
 
 # average over k
-
-# result is state discomfort
-
-# If future looks settled over random sampling of reasonable actions -> state is settled/low energy
-
-# Else, only a narrow set of actions would have produced the observed result; situation was very action dependent
-
-# Asking "is the observed outcome consistent with what the model expects under many reasonable actions"
-
-# "Was precept already implied by the state of knowledge or did it still depend on the action i chose."
-
-# store (precept latent at subsampled step, stat discomfort) to a dataset.
 
 # Train energy student
 

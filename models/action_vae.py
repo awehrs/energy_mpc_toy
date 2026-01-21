@@ -2,6 +2,7 @@ from typing import Dict, Optional
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from einops import repeat
 from omegaconf import DictConfig
 from jaxtyping import Bool, Int, Int32, Int64, Float
@@ -160,6 +161,9 @@ class VariationalAutoEncoder(nn.Module):
         model_name: str,
         d_latent: int,
         n_latents: int = 256,
+        vocab_size: int = 151666,
+        pad_token_id: int = -100,
+        max_action_len: int = 1024,
         n_self_attn_heads: int = 8,
         n_cross_attn_heads: int = 8,
         n_encoder_self_attn_layers: int = 6,
@@ -177,12 +181,13 @@ class VariationalAutoEncoder(nn.Module):
             model_name=model_name,
             n_latents=n_latents,
             latent_dim=d_latent,
+            vocab_size=vocab_size,
+            pad_token_id=pad_token_id,
+            max_action_len=max_action_len,
             n_self_attn_layers=n_decoder_self_attn_layers,
             n_self_attn_heads=n_self_attn_heads,
             dropout=dropout,
         )
-
-        vocab_size = self.generative_model.config.vocab_size
 
         self.recognition_model = VariationalEncoder(
             d_model=d_latent,
@@ -202,11 +207,12 @@ class VariationalAutoEncoder(nn.Module):
         input_ids: Float[torch.Tensor, "batch seq_len"],
         max_seq_len: Optional[int] = None,
         cu_seq_lens: Optional[Int32[torch.Tensor, "batch+1"]] = None,
-        token_indices: Optional[Int64[torch.Tensor, "total_batch_tokens"]] = None,
-        latent_indices: Optional[Int64[torch.Tensor, "total_batch_latents"]] = None,
         position_ids: Optional[Int64[torch.Tensor, "batch*seq_len"]] = None,
-        adjusted_position_ids: Optional[Int64[torch.Tensor, "batch*seq_len"]] = None,
+        latent_indices: Optional[Int64[torch.Tensor, "batch*n_latents"]] = None,
+        padding_indices: Optional[Int64[torch.Tensor, "batch*seq_len"]] = None,
+        decoder_position_ids: Optional[Int[torch.Tensor, "batch*total_seq_len"]] = None,
         attn_mask: Optional[Bool[torch.Tensor, "batch*seq_len"]] = None,
+        targets: Optional[torch.Tensor] = None,
     ) -> Dict[str, Float[torch.Tensor, "batch seq_len dim"]]:
 
         if attn_mask is not None:
@@ -214,9 +220,6 @@ class VariationalAutoEncoder(nn.Module):
             assert max_seq_len is None
             assert cu_seq_lens is None
             assert position_ids is None
-            assert token_indices is None
-            assert latent_indices is None
-            assert adjusted_position_ids is None
 
         if position_ids is not None:
             # We're doing sequence packing + Flash Attention.
@@ -224,7 +227,8 @@ class VariationalAutoEncoder(nn.Module):
             assert max_seq_len is not None
             assert cu_seq_lens is not None
             assert latent_indices is not None
-            assert adjusted_position_ids is not None
+            assert padding_indices is not None
+            assert decoder_position_ids is not None
 
         variational_params = self.recognition_model(
             input_ids=input_ids,
@@ -249,14 +253,38 @@ class VariationalAutoEncoder(nn.Module):
 
         logits = self.generative_model(
             z,
-            target_tokens=input_ids,
-            token_indices=token_indices,
+            position_ids=decoder_position_ids,
             latent_indices=latent_indices,
-            position_ids=adjusted_position_ids,
+            padding_indices=padding_indices,
         )
 
-        return {
-            "mean": mu,
-            "log_var": log_sigma,
-            "logits": logits,
-        }
+        if targets is not None:
+            targets_flat = targets.reshape(-1)
+
+            # Don't compute all at once
+            chunk_size = 2048
+            total_loss = 0
+            num_chunks = 0
+
+            for i in range(0, len(logits), chunk_size):
+                chunk_logits = logits[i : i + chunk_size]
+                chunk_targets = targets_flat[i : i + chunk_size]
+
+                chunk_loss = F.cross_entropy(
+                    chunk_logits,
+                    chunk_targets,
+                    ignore_index=-100,
+                    reduction="sum",
+                )
+                total_loss += chunk_loss
+                num_chunks += (chunk_targets != -100).sum()
+
+            recon_loss = total_loss / num_chunks
+
+            return {
+                "loss": recon_loss,
+                "mean": mu,
+                "log_var": log_sigma,
+            }
+        else:
+            return {"logits": logits, "mean": mu, "log_var": log_sigma}

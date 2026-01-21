@@ -1,3 +1,4 @@
+from abc import ABC
 from typing import Dict
 
 import torch
@@ -5,8 +6,8 @@ import torch.nn as nn
 from einops import rearrange
 from jaxtyping import Bool, Float, Integer
 
-from models.attention import Attention, MLP
 from models.sensors import LanguageSensor
+from models.attention import Attention, MLP
 
 
 try:
@@ -68,7 +69,26 @@ class ActionFusion(nn.Module):
         return precepts
 
 
-class DynamicsModel(nn.Module):
+class DynamicsModel(ABC, nn.Module):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+
+    def update_state(
+        self,
+        inputs: torch.Tensor,
+        state: torch.Tensor,
+    ) -> torch.Tensor:
+        pass
+
+    def predict(
+        self,
+        action: torch.Tensor,
+        state: torch.Tensor,
+    ) -> torch.Tensor:
+        pass
+
+
+class DynamicsModel_(nn.Module):
     def __init__(
         self,
         model_name: str,
@@ -151,3 +171,11 @@ class DynamicsModel(nn.Module):
             "output": y,
             "state": h,
         }
+
+    def update_state(
+        self,
+        precept: torch.Tensor,
+        state: torch.Tensor,
+        attention_mask: torch.Tensor,
+    ) -> torch.Tensor:
+        pass

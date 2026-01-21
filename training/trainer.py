@@ -73,8 +73,10 @@ class AccelerateTrainer:
         train_dataset: Dataset,
         eval_dataset: Optional[Dataset] = None,
         collate_fn: Optional[Callable] = None,
-        sampler: Optional[Callable] = None,
-        batch_sampler: Optional[Callable] = None,
+        eval_sampler: Optional[Callable] = None,
+        train_sampler: Optional[Callable] = None,
+        eval_batch_sampler: Optional[Callable] = None,
+        train_batch_sampler: Optional[Callable] = None,
         eval_fn: Optional[Callable] = None,
         tokenizer: Optional[Any] = None,
     ):
@@ -144,33 +146,38 @@ class AccelerateTrainer:
             self.train_dataset,
             is_train=True,
             collate_fn=collate_fn,
-            sampler=sampler,
-            batch_sampler=batch_sampler,
+            sampler=train_sampler,
+            batch_sampler=train_batch_sampler,
         )
+
         eval_dataloader = None
         if self.eval_dataset is not None:
             eval_dataloader = self._create_dataloader(
                 self.eval_dataset,
                 is_train=False,
                 collate_fn=collate_fn,
-                sampler=sampler,
-                batch_sampler=batch_sampler,
+                sampler=eval_sampler,
+                batch_sampler=eval_batch_sampler,
             )
 
         # Calculate total training steps
         if config.max_steps > 0:
             self.total_steps = config.max_steps
         else:
-            total_batches = len(self.train_dataset) // (
-                config.per_device_train_batch_size * self.accelerator.num_processes
-            )
-            steps_per_epoch = total_batches // config.gradient_accumulation_steps
-            self.total_steps = steps_per_epoch * config.num_epochs
+            if train_batch_sampler is not None:
+                num_batches = len(train_batch_sampler)
+                steps_per_epoch = num_batches // config.gradient_accumulation_steps
+                self.total_steps = steps_per_epoch * config.num_epochs
+            else:
+                total_batches = len(self.train_dataset) // (
+                    config.per_device_train_batch_size * self.accelerator.num_processes
+                )
+                steps_per_epoch = total_batches // config.gradient_accumulation_steps
+                self.total_steps = steps_per_epoch * config.num_epochs
 
-        # Initialize learning rate scheduler
-        self.lr_scheduler = self._create_lr_scheduler(self.total_steps)
+            # Initialize learning rate scheduler
+            self.lr_scheduler = self._create_lr_scheduler(self.total_steps)
 
-        # Prepare everything with Accelerator
         (
             self.model,
             self.optimizer,
@@ -299,21 +306,51 @@ class AccelerateTrainer:
         batch_sampler: Callable = None,
     ) -> DataLoader:
         """Create dataloader. Can be overridden for custom collation."""
-        return DataLoader(
-            dataset,
-            batch_size=self._get_batch_size(is_train),
-            shuffle=is_train,
-            sampler=sampler,
-            batch_sampler=batch_sampler,
-            collate_fn=collate_fn,
-            num_workers=self.config.dataloader_num_workers,
-            pin_memory=(
-                self.config.dataloader_pin_memory
-                if torch.cuda.is_available()
-                else False
-            ),
-            drop_last=is_train,
-        )
+
+        assert not (
+            sampler and batch_sampler
+        ), "Cannot use both sampler and batch_sampler"
+
+        if batch_sampler:
+            return DataLoader(
+                dataset,
+                batch_sampler=batch_sampler,
+                collate_fn=collate_fn,
+                num_workers=0,
+                pin_memory=(
+                    self.config.dataloader_pin_memory
+                    if torch.cuda.is_available()
+                    else False
+                ),
+            )
+        elif sampler:
+            return DataLoader(
+                dataset,
+                batch_size=self._get_batch_size(is_train),
+                sampler=sampler,
+                collate_fn=collate_fn,
+                num_workers=self.config.dataloader_num_workers,
+                pin_memory=(
+                    self.config.dataloader_pin_memory
+                    if torch.cuda.is_available()
+                    else False
+                ),
+            )
+        else:
+            # Standard dataloader
+            return DataLoader(
+                dataset,
+                batch_size=self._get_batch_size(is_train),
+                shuffle=is_train,
+                collate_fn=collate_fn,
+                num_workers=self.config.dataloader_num_workers,
+                pin_memory=(
+                    self.config.dataloader_pin_memory
+                    if torch.cuda.is_available()
+                    else False
+                ),
+                drop_last=is_train,
+            )
 
     def _get_batch_size(self, is_train=True) -> int:
         """Get batch size for train/eval."""
@@ -459,6 +496,16 @@ class AccelerateTrainer:
 
         for epoch in range(self.epoch, self.config.num_epochs):
             self.epoch = epoch
+
+            # Set epoch for distributed sampler/batch_sampler
+            if hasattr(self.train_dataloader, "batch_sampler"):
+                batch_sampler = self.train_dataloader.batch_sampler
+                if hasattr(batch_sampler, "set_epoch"):
+                    batch_sampler.set_epoch(epoch)
+            elif hasattr(self.train_dataloader, "sampler"):
+                sampler = self.train_dataloader.sampler
+                if hasattr(sampler, "set_epoch"):
+                    sampler.set_epoch(epoch)
 
             for batch in self.train_dataloader:
 
