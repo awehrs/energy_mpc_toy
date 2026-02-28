@@ -9,18 +9,25 @@ from typing import Callable, Dict, Optional, Tuple, Union
 import hydra
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 from omegaconf import DictConfig, OmegaConf
 from transformers import DataCollatorWithFlattening
 from pydantic.warnings import UnsupportedFieldAttributeWarning
 
 from training.trainer import AccelerateTrainer
+from training.train_action_vae import (
+    CorruptionScheduler,
+    LinearWarmupHold,
+    PackedBatchSampler,
+    SequencePackedCollator,
+)
 from dataset.action_dataset import ActionDataset
-from models.action_vae import VariationalAutoEncoder
+from models.sensors import LanguageSensor
+from models.actuators import LanguageActuator
+from models.attention import Downsampler
+
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
-
 
 warnings.filterwarnings(
     "ignore",
@@ -361,85 +368,136 @@ class PackedBatchSampler:
             yield batch
 
 
-class VAETrainer(AccelerateTrainer):
+class FrozenJEPAEncoder(nn.Module):
+    """Frozen JEPA sensor + action_downsampler for producing action latents."""
+
+    def __init__(self, sensor: LanguageSensor, action_downsampler: Downsampler):
+        super().__init__()
+        self.sensor = sensor
+        self.action_downsampler = action_downsampler
+        self.requires_grad_(False)
+
+    @torch.no_grad()
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        position_ids: torch.Tensor,
+        max_seq_len: int,
+        cu_seq_lens: torch.Tensor,
+    ) -> torch.Tensor:
+        """Encode tokens → latents.
+
+        Args:
+            input_ids:    [total_tokens]   — packed flat token ids
+            position_ids: [total_tokens]   — per-token position ids
+            max_seq_len:  int              — longest sequence in the batch
+            cu_seq_lens:  [num_seqs + 1]   — cumulative token counts
+
+        Returns:
+            [total_steps * n_action_latents, d]  — packed action latents
+        """
+        hidden = self.sensor(input_ids=input_ids, position_ids=position_ids)
+        latents = self.action_downsampler(
+            embedding=hidden,
+            max_seq_len=max_seq_len,
+            cu_seq_lens=cu_seq_lens,
+        )
+        return latents
+
+
+class ActuatorWithEncoder(nn.Module):
+    """Wraps frozen JEPA encoder + trainable LanguageActuator for training.
+
+    The config attribute is needed by AccelerateTrainer (for model_config).
+    """
+
+    def __init__(
+        self,
+        config: DictConfig,
+        encoder: FrozenJEPAEncoder,
+        actuator: LanguageActuator,
+    ):
+        super().__init__()
+        self.config = config
+        self.encoder = encoder
+        self.actuator = actuator
+
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        corrupted_ids: torch.Tensor,
+        position_ids: torch.Tensor,
+        max_seq_len: int,
+        cu_seq_lens: torch.Tensor,
+        targets: Optional[torch.Tensor] = None,
+    ) -> Dict[str, torch.Tensor]:
+        latents = self.encoder(
+            input_ids=input_ids,
+            position_ids=position_ids,
+            max_seq_len=max_seq_len,
+            cu_seq_lens=cu_seq_lens,
+        )
+        return self.actuator(
+            latents=latents,
+            input_ids=corrupted_ids,
+            position_ids=position_ids,
+            max_seq_len_q=max_seq_len,
+            cu_seq_lens_q=cu_seq_lens,
+            targets=targets,
+        )
+
+
+class ActuatorTrainer(AccelerateTrainer):
     def __init__(
         self,
         model: nn.Module,
         config: DictConfig,
-        rate_scheduler: CorruptionScheduler,
+        corruption_scheduler: CorruptionScheduler,
         train_dataset: torch.utils.data.Dataset,
         eval_dataset: Optional[torch.utils.data.Dataset] = None,
-        data_collate_fn: Optional[DataCollatorWithFlattening] = None,
-        eval_batch_sampler: Optional[Callable] = None,
+        collate_fn: Optional[Callable] = None,
         train_batch_sampler: Optional[Callable] = None,
+        eval_batch_sampler: Optional[Callable] = None,
         eval_fn: Optional[Callable] = None,
         tokenizer: Optional[Callable] = None,
     ):
-
         super().__init__(
             model=model,
             config=config,
             train_dataset=train_dataset,
             eval_dataset=eval_dataset,
-            collate_fn=data_collate_fn,
-            eval_batch_sampler=eval_batch_sampler,
+            collate_fn=collate_fn,
             train_batch_sampler=train_batch_sampler,
+            eval_batch_sampler=eval_batch_sampler,
             eval_fn=eval_fn,
             tokenizer=tokenizer,
         )
-
-        self.kl_anneal_steps = config.kl_anneal_steps
-        self.free_bits = config.free_bits
-        self.data_collate_fn = data_collate_fn
-        self.rate_scheduler = rate_scheduler
+        self.corruption_scheduler = corruption_scheduler
 
     def _compile(self):
-
-        self.model.recognition_model = torch.compile(
-            self.model.recognition_model,
+        self.model.actuator.self_attention_layers = torch.compile(
+            self.model.actuator.self_attention_layers,
             mode=self.config.torch_compile_mode,
         )
-        self.model.generative_model.self_attention_layers = torch.compile(
-            self.model.generative_model.self_attention_layers,
+        self.model.actuator.projection = torch.compile(
+            self.model.actuator.projection,
             mode=self.config.torch_compile_mode,
         )
-        self.model.generative_model.projection = torch.compile(
-            self.model.generative_model.projection,
-            mode=self.config.torch_compile_mode,
-        )
-
         return self.model
 
-    def get_kl_weight(self) -> float:
-        """Linear KL annealing from 0 to 1, with initial warmup delay."""
-        kl_warmup_delay = getattr(self.config, 'kl_warmup_delay', 500)
-        if self.global_step < kl_warmup_delay:
-            return 0.0
-        adjusted_step = self.global_step - kl_warmup_delay
-        return min(1.0, adjusted_step / self.kl_anneal_steps)
+    def on_optimizer_step_end(self):
+        self.optimizer.step()
+        self.lr_scheduler.step()
+        self.corruption_scheduler.set_step(self.global_step)
+        self.optimizer.zero_grad()
 
     def train_micro_step(self, batch, timer):
-        """Override to add encoder gradient diagnostics."""
         loss, additional_metrics, grad_norm = super().train_micro_step(batch, timer)
 
-        # Compute encoder gradient norm after backward
-        encoder = self.model.recognition_model
+        # Cross-attention gradient norm diagnostic
+        decoder = self.model.actuator.decoder
         if hasattr(self.model, "module"):
-            encoder = self.model.module.recognition_model
-
-        enc_grad_norm = 0.0
-        enc_grad_count = 0
-        for p in encoder.parameters():
-            if p.grad is not None:
-                enc_grad_norm += p.grad.data.norm(2).item() ** 2
-                enc_grad_count += 1
-        if enc_grad_count > 0:
-            enc_grad_norm = enc_grad_norm ** 0.5
-
-        # Compute cross-attention gradient norm
-        decoder = self.model.generative_model.decoder
-        if hasattr(self.model, "module"):
-            decoder = self.model.module.generative_model.decoder
+            decoder = self.model.module.actuator.decoder
 
         xattn_grad_norm = 0.0
         xattn_grad_count = 0
@@ -448,26 +506,33 @@ class VAETrainer(AccelerateTrainer):
                 xattn_grad_norm += p.grad.data.norm(2).item() ** 2
                 xattn_grad_count += 1
         if xattn_grad_count > 0:
-            xattn_grad_norm = xattn_grad_norm ** 0.5
+            xattn_grad_norm = xattn_grad_norm**0.5
 
-        additional_metrics["enc_grad_norm"] = enc_grad_norm
         additional_metrics["xattn_grad_norm"] = xattn_grad_norm
 
         return loss, additional_metrics, grad_norm
 
-    def on_optimizer_step_end(self):
-        """Override to control scheduler stepping."""
-        self.optimizer.step()
-        self.lr_scheduler.step()
-        self.rate_scheduler.set_step(self.global_step)
-        self.optimizer.zero_grad()
-
-
+    def save_checkpoint(self, step: int, is_best: bool = False):
+        super().save_checkpoint(step, is_best)
+        if self.accelerator.is_main_process:
+            model = self.accelerator.unwrap_model(self.model)
+            checkpoint_dir = Path(self.config.output_dir) / f"checkpoint-{step}"
+            checkpoint_dir.mkdir(parents=True, exist_ok=True)
+            torch.save(
+                model.actuator.state_dict(),
+                checkpoint_dir / "actuator.pt",
+            )
+            if is_best:
+                best_dir = Path(self.config.output_dir) / "best_model"
+                best_dir.mkdir(parents=True, exist_ok=True)
+                torch.save(
+                    model.actuator.state_dict(),
+                    best_dir / "actuator.pt",
+                )
 
     def _compute_loss(
         self, batch: Dict[str, torch.Tensor]
     ) -> Tuple[torch.Tensor, Dict[str, float]]:
-        """Compute VAE loss (reconstruction + KL divergence)."""
 
         targets = batch["labels"]
         input_ids = batch["input_ids"]
@@ -477,161 +542,47 @@ class VAETrainer(AccelerateTrainer):
         position_ids = batch["position_ids"]
 
         with self.accelerator.autocast():
-
             outputs = self.model(
                 input_ids=input_ids,
                 corrupted_ids=corrupted_ids,
+                position_ids=position_ids,
                 max_seq_len=max_seq_len,
                 cu_seq_lens=cu_seq_lens,
-                position_ids=position_ids,
                 targets=targets,
-                return_hidden_state=False,
             )
 
-        recon_loss = outputs["loss"]
-
-        kl_per_dim = -0.5 * (
-            1 + outputs["log_var"] - outputs["mean"] ** 2 - outputs["log_var"].exp()
-        )
-        kl_per_latent = kl_per_dim.sum(dim=-1)  # [batch * n_latents]
-
-        free = kl_per_latent.new_full((), float(self.free_bits))
-        kl_per_latent = torch.clamp(kl_per_latent, min=free)
-
-        # Reshape to [batch, n_latents], sum over latents, mean over batch
-        batch_size = len(cu_seq_lens) - 1
-        kl_per_sample = kl_per_latent.view(batch_size, -1).sum(dim=-1)  # [batch]
-        kl_loss = kl_per_sample.mean()
-        kl_weight = self.get_kl_weight()
-        loss = recon_loss + kl_weight * kl_loss
-
-        # Diagnostics: encoder outputs
-        mean = outputs["mean"].detach()
-        log_var = outputs["log_var"].detach()
-
-        # KL before clamping (to see true KL)
-        kl_raw = kl_per_dim.sum(dim=-1).mean().detach()
+        loss = outputs["loss"]
 
         metrics = {
-            "recon_loss": recon_loss.detach(),
-            "kl_loss": kl_loss.detach(),
-            "kl_weight": kl_weight,
-            # Encoder diagnostics
-            "enc_mean_abs": mean.abs().mean(),
-            "enc_mean_std": mean.std(),
-            "enc_log_var_mean": log_var.mean(),
-            "enc_log_var_std": log_var.std(),
-            "enc_variance_mean": log_var.exp().mean(),
-            "kl_raw": kl_raw,  # KL before free_bits clamping
+            "recon_loss": loss.detach(),
         }
 
         return loss, metrics
-
-    def _default_eval_fn(self, eval_dataloader):
-        """Override eval to add generation samples."""
-
-        eval_metrics = super()._default_eval_fn(eval_dataloader)
-
-        if self.accelerator.is_main_process:
-            self._log_generation_samples(n_samples=5)
-
-        return eval_metrics
-
-    def _log_generation_samples(self, n_samples: int = 5):
-        """Generate and log samples from random latents."""
-
-        logging.info("=" * 60)
-        logging.info("GENERATION SAMPLES FROM RANDOM LATENTS")
-        logging.info("=" * 60)
-
-        self.model.eval()
-
-        with torch.no_grad():
-            for i in range(n_samples):
-                # Sample random latent (packed format: [n_latents, d_latent])
-                z = torch.randn(
-                    self.model.n_latents,
-                    self.model.d_latent,
-                    device=self.accelerator.device,
-                    dtype=torch.bfloat16,
-                )
-
-                try:
-                    # Generate from latent
-                    generated_ids = self.model.generative_model.generate(
-                        latent=z,
-                        max_length=256,
-                        temperature=0.8,
-                        top_p=0.9,
-                        bos_token_id=self.tokenizer.bos_token_id,
-                    )
-
-                    # Decode to text
-                    text = self.tokenizer.decode(
-                        generated_ids[0], skip_special_tokens=True
-                    )
-
-                except Exception as e:
-                    text = f"[Generation failed: {str(e)}]"
-                    import traceback
-
-                    logging.error(traceback.format_exc())
-
-                logging.info(f"\nSample {i}:")
-                logging.info(text)
-                logging.info("-" * 60)
-
-        logging.info("=" * 60)
-
-        # Return to train mode
-        self.model.train()
 
 
 # Find config directory - handle both local and container environments
 script_dir = Path(__file__).parent
 if (script_dir / "conf").exists():
-    # Container environment: config is next to script
     config_path = str(script_dir / "conf")
 else:
-    # Local environment: config is at project root
     project_root = script_dir.parent
     config_path = str(project_root / "conf")
 
 
-@hydra.main(version_base=None, config_path=config_path, config_name="config")
-def main(cfg: DictConfig):
+@hydra.main(version_base="1.1", config_path="../conf", config_name="config")
+def main(cfg: DictConfig) -> None:
 
     local_rank = int(os.environ.get("LOCAL_RANK", 0))
 
     OmegaConf.register_new_resolver("eval", eval)
     OmegaConf.resolve(cfg)
 
-    # dataset = ActionDataset.build_dataset(cfg.dataset)
+    assert (
+        cfg.training.jepa_checkpoint is not None
+    ), "Must specify training.jepa_checkpoint for actuator training"
+    jepa_dir = Path(cfg.training.jepa_checkpoint)
 
-    # eval_size = 1
-    # train_size = len(dataset) - eval_size
-
-    # generator = torch.Generator().manual_seed(cfg.training.seed)
-
-    # train_dataset, eval_dataset = torch.utils.data.random_split(
-    #     dataset,
-    #     lengths=[train_size, eval_size],
-    #     generator=generator,
-    # )
-
-    # train_batch_sampler = PackedBatchSampler(
-    #     train_dataset, max_tokens=cfg.training.max_tokens_per_batch
-    # )
-
-    # dl = torch.utils.data.DataLoader(
-    #     dataset,
-    #     collate_fn=SequencePackedCollator(pad_token_id=dataset.tokenizer.pad_token_id),
-    #     batch_size=4,
-    # )
-
-    # batch = next(iter(dl))
-
-    # assert False
+    # --- Load dataset ---
 
     dataset = ActionDataset.load(
         src_dir=Path(
@@ -644,7 +595,7 @@ def main(cfg: DictConfig):
         logging.info("Calculating dataset statistics...")
         logging.info(dataset.stats)
 
-    eval_size = 20_000  # int(len(dataset) * 0.1)
+    eval_size = 20_000
     train_size = len(dataset) - eval_size
 
     generator = torch.Generator().manual_seed(cfg.training.seed)
@@ -655,22 +606,49 @@ def main(cfg: DictConfig):
         generator=generator,
     )
 
-    model_cfg = cfg.model.action_model
+    # --- Build frozen JEPA encoder ---
 
-    model = VariationalAutoEncoder(
-        config=model_cfg,
-        model_name=model_cfg.model_name,
-        d_latent=model_cfg.d_latent,
-        n_latents=model_cfg.n_action_latents,
-        vocab_size=len(dataset.tokenizer),
+    sensor = LanguageSensor(
+        model_name=cfg.model.sensor.model_name,
+        d_model=cfg.model.d_model,
+    )
+    sensor.projection.load_state_dict(
+        torch.load(jepa_dir / "sensor_projection.pt", weights_only=True)
+    )
+
+    action_downsampler = Downsampler(
+        d_model=cfg.model.d_model,
+        n_latents=cfg.model.n_action_latents,
+        n_heads=cfg.model.n_heads,
+        norm_eps=cfg.model.norm_eps,
+    )
+    action_downsampler.load_state_dict(
+        torch.load(jepa_dir / "action_downsampler.pt", weights_only=True)
+    )
+
+    frozen_encoder = FrozenJEPAEncoder(sensor, action_downsampler)
+
+    # --- Build actuator ---
+
+    actuator = LanguageActuator(
+        model_name=cfg.model.sensor.model_name,
+        n_latents=cfg.model.n_action_latents,
+        latent_dim=cfg.model.d_model,
         pad_token_id=dataset.tokenizer.pad_token_id,
-        max_action_len=model_cfg.max_action_len,
-        n_self_attn_heads=model_cfg.n_self_attn_heads,
-        n_cross_attn_heads=model_cfg.n_cross_attn_heads,
-        n_encoder_self_attn_layers=model_cfg.n_encoder_self_attn_layers,
-        n_decoder_self_attn_layers=model_cfg.n_decoder_self_attn_layers,
-        dropout=model_cfg.dropout,
-    ).to(torch.bfloat16)
+        max_action_len=cfg.max_action_len,
+        n_self_attn_layers=cfg.model.action_model.n_decoder_self_attn_layers,
+        n_self_attn_heads=cfg.n_self_attn_heads,
+        n_cross_attn_heads=cfg.n_cross_attn_heads,
+        dropout=cfg.dropout,
+    )
+
+    model = ActuatorWithEncoder(
+        config=cfg,
+        encoder=frozen_encoder,
+        actuator=actuator,
+    )
+
+    # --- Collation ---
 
     corruption_scheduler = LinearWarmupHold(
         start_corruption_rate=cfg.training.corruption_start_rate,
@@ -680,18 +658,13 @@ def main(cfg: DictConfig):
         full_mask_prob=cfg.training.corruption_full_mask_prob,
     )
 
-    datacollator = SequencePackedCollator(
+    collator = SequencePackedCollator(
         corruption_scheduler=corruption_scheduler,
-        n_latents=cfg.model.action_model.n_action_latents,
+        n_latents=cfg.model.n_action_latents,
         max_action_len=cfg.max_action_len,
         mask_token_id=dataset.tokenizer.convert_tokens_to_ids("<|fim_pad|>"),
         pad_token_id=dataset.tokenizer.pad_token_id,
         return_flash_attn_kwargs=True,
-    )
-
-    eval_batch_sampler = PackedBatchSampler(
-        eval_dataset,
-        max_tokens=cfg.training.max_tokens_per_batch,
     )
 
     train_batch_sampler = PackedBatchSampler(
@@ -699,19 +672,28 @@ def main(cfg: DictConfig):
         max_tokens=cfg.training.max_tokens_per_batch,
     )
 
-    trainer = VAETrainer(
+    eval_batch_sampler = PackedBatchSampler(
+        eval_dataset,
+        max_tokens=cfg.training.max_tokens_per_batch,
+    )
+
+    # --- Train ---
+
+    trainer = ActuatorTrainer(
         model=model,
         config=cfg.training,
-        rate_scheduler=corruption_scheduler,
+        corruption_scheduler=corruption_scheduler,
         train_dataset=train_dataset,
         eval_dataset=eval_dataset,
-        data_collate_fn=datacollator,
-        eval_batch_sampler=eval_batch_sampler,
+        collate_fn=collator,
         train_batch_sampler=train_batch_sampler,
+        eval_batch_sampler=eval_batch_sampler,
         tokenizer=dataset.tokenizer,
     )
 
+    logger.info("Starting actuator training...")
     trainer.train()
+    logger.info("Actuator training completed!")
 
 
 if __name__ == "__main__":

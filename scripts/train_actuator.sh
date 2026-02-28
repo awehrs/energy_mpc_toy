@@ -2,16 +2,18 @@
 source .env
 
 # Configuration
-INSTANCE_TYPE=gpu_1x_h100_pcie #gpu_8x_a100_80gb_sxm4 
+INSTANCE_TYPE=gpu_1x_h100_pcie #gpu_8x_a100_80gb_sxm4
 SSH_NAME=scoobdoob
 SSH_PATH=~/.ssh/scoobdoob.pem
 GCS_BUCKET=energy-mpc
 LOCAL_CACHE=/tmp/datasets
 DATASET_NAME=action_dataset
 PROJECT_NAME=energy_mpc_toy
+JEPA_CHECKPOINT_GCS=training/jepa-model/latest
+JEPA_CHECKPOINT_LOCAL=/tmp/jepa_checkpoint
 
 
-echo "🚀 Setting up action VAE training on Lambda Labs..."
+echo "🚀 Setting up actuator training on Lambda Labs..."
 
 
 MAX_TRIES=500
@@ -63,30 +65,30 @@ MAX_LAUNCH_RETRIES=5
 
 for attempt in $(seq 1 $MAX_LAUNCH_RETRIES); do
     echo "   Launch attempt $attempt/$MAX_LAUNCH_RETRIES..."
-    
+
     LAUNCH_RESPONSE=$(curl -s -u "$LAMBDA_LABS_API_KEY": https://cloud.lambdalabs.com/api/v1/instance-operations/launch \
         -d @lambda-config.json -H "Content-Type: application/json")
-    
+
     INSTANCE_ID=$(echo $LAUNCH_RESPONSE | jq -r '.data.instance_ids[0]')
-    
+
     if [ "$INSTANCE_ID" != "null" ] && [ "$INSTANCE_ID" != "" ]; then
         echo "✅ Instance launched: $INSTANCE_ID"
         break
     fi
-    
+
     echo "   Launch failed, response:"
     echo $LAUNCH_RESPONSE | jq '.error'
-    
+
     if [ $attempt -lt $MAX_LAUNCH_RETRIES ]; then
         echo "   Waiting 30s before retry..."
-        sleep 30s
-        
+        sleep 30
+
         # Refresh region availability for retry
         echo "   Checking for new capacity..."
         NEW_REGION=$(curl -s -u $LAMBDA_LABS_API_KEY: https://cloud.lambdalabs.com/api/v1/instance-types \
             | jq -r --arg instance_type "$INSTANCE_TYPE" \
             '.data | .[$instance_type] | .regions_with_capacity_available | .[0] | .name')
-        
+
         if [ "$NEW_REGION" != "null" ] && [ "$NEW_REGION" != "$REGION" ]; then
             echo "   Found capacity in new region: $NEW_REGION"
             REGION=$NEW_REGION
@@ -111,6 +113,23 @@ if [ "$INSTANCE_ID" = "null" ] || [ "$INSTANCE_ID" = "" ]; then
     exit 1
 fi
 
+# Setup cleanup trap immediately after instance is created
+cleanup() {
+    echo "🧹 Cleaning up..."
+    rm -f lambda-config.json
+
+    if [ ! -z "$INSTANCE_ID" ]; then
+        echo "🛑 Terminating instance $INSTANCE_ID..."
+        curl -s -u "$LAMBDA_LABS_API_KEY": \
+            https://cloud.lambdalabs.com/api/v1/instance-operations/terminate \
+            -d "{\"instance_ids\": [\"$INSTANCE_ID\"]}" \
+            -H "Content-Type: application/json" > /dev/null
+        echo "✅ Instance terminated"
+    fi
+}
+
+trap cleanup EXIT
+
 # Wait for instance to be ready
 echo "⏳ Waiting for instance to be ready..."
 sleep 3m
@@ -122,18 +141,18 @@ MAX_IP_RETRIES=50
 
 for attempt in $(seq 1 $MAX_IP_RETRIES); do
     echo "   IP attempt $attempt/$MAX_IP_RETRIES..."
-    
+
     IP_RESPONSE=$(curl -s -u $LAMBDA_LABS_API_KEY: https://cloud.lambdalabs.com/api/v1/instances/${INSTANCE_ID})
     INSTANCE_IP=$(echo $IP_RESPONSE | jq -r '.data.ip')
-    
+
     if [ "$INSTANCE_IP" != "null" ] && [ "$INSTANCE_IP" != "" ]; then
         echo "✅ Instance IP: $INSTANCE_IP"
         break
     fi
-    
+
     if [ $attempt -lt $MAX_IP_RETRIES ]; then
         echo "   No IP yet, waiting 20s..."
-        sleep 20s
+        sleep 20
     fi
 done
 
@@ -153,17 +172,17 @@ MAX_SSH_RETRIES=100
 
 for attempt in $(seq 1 $MAX_SSH_RETRIES); do
     echo "   SSH attempt $attempt/$MAX_SSH_RETRIES..."
-    
+
     if ssh -o BatchMode=yes -o StrictHostKeyChecking=accept-new -o ConnectTimeout=15 \
            -i $SSH_PATH ubuntu@${INSTANCE_IP} 'echo "SSH ready"' >/dev/null 2>&1; then
         echo "✅ SSH connection successful"
         SSH_READY=true
         break
     fi
-    
+
     if [ $attempt -lt $MAX_SSH_RETRIES ]; then
-        echo "   SSH not ready, waiting 30s..."
-        sleep 30s
+        echo "   SSH not ready, waiting 30..."
+        sleep 30
     fi
 done
 
@@ -174,29 +193,9 @@ if [ "$SSH_READY" = false ]; then
     exit 1
 fi
 
-# Setup cleanup trap
-cleanup() {
-    echo "🧹 Cleaning up..."
-    rm -f lambda-config.json
-    
-    if [ ! -z "$INSTANCE_ID" ]; then
-        echo "🛑 Terminating instance $INSTANCE_ID..."
-        curl -s -u "$LAMBDA_LABS_API_KEY": \
-            https://cloud.lambdalabs.com/api/v1/instance-operations/terminate \
-            -d "{\"instance_ids\": [\"$INSTANCE_ID\"]}" \
-            -H "Content-Type: application/json" > /dev/null
-        echo "✅ Instance terminated"
-    fi
-}
-
-# Set trap for cleanup on exit
-trap cleanup EXIT
-
 # Sync project code
 cp ~/.config/gcloud/servicekey.json ./servicekey.json
 
-# Add to gitignore
-echo "servicekey.json" >> .gitignore
 echo "📁 Syncing project code..."
 rsync -av --progress \
     --exclude='.git' \
@@ -219,13 +218,14 @@ echo "⚙️  Setting up environment and starting training..."
 
 cat > setup_and_train.sh << 'EOF'
 #!/bin/bash
-set -e
 
 PROJECT_NAME=$1
 WANDB_API_KEY=$2
 GCS_BUCKET=$3
-LOCAL_CACHE=$4    
+LOCAL_CACHE=$4
 DATASET_NAME=$5
+JEPA_CHECKPOINT_GCS=$6
+JEPA_CHECKPOINT_LOCAL=$7
 
 echo "⚡ Installing uv..."
 
@@ -254,7 +254,6 @@ export WANDB_API_KEY=$WANDB_API_KEY
 echo "Python Info:"
 uv run python --version
 uv pip list | grep torch
-uv run python -c 'import flash_attn; print(flash_attn.__version__)'
 
 # Set up cloud authorizations.
 
@@ -268,75 +267,88 @@ fi
 
 gcloud auth activate-service-account --key-file=./servicekey.json
 
-# Get dataset. 
+# Get dataset.
 if gsutil ls "gs://$GCS_BUCKET/datasets/${DATASET_NAME}.tar.gz" &> /dev/null; then
     echo "Downloading compressed dataset from GCS..."
     mkdir -p "$LOCAL_CACHE"
     gsutil -m cp "gs://$GCS_BUCKET/datasets/${DATASET_NAME}.tar.gz" "$LOCAL_CACHE/"
-    
+
     # Decompress
     echo "Decompressing dataset..."
     tar -I pigz -xf "$LOCAL_CACHE/${DATASET_NAME}.tar.gz" -C "$LOCAL_CACHE"
-    
+
     echo "Cleaning up compressed file..."
     rm "$LOCAL_CACHE/${DATASET_NAME}.tar.gz"
-    
+
     echo "✅ Dataset downloaded and decompressed"
 else
     # Build locally if not in GCS
     echo "Dataset not in GCS, building locally..."
     cd ~/${PROJECT_NAME}
-    uv run python dataset/action_dataset.py
-    
+    uv run python dataset/action_dataset.py \
+        training.dataset_name=${DATASET_NAME} \
+        training.cache_dir=${LOCAL_CACHE}
+
     # Check if build succeeded
     if [ ! -d "$LOCAL_CACHE/$DATASET_NAME" ]; then
         echo "❌ Dataset build failed - directory not found at $LOCAL_CACHE/$DATASET_NAME"
         exit 1
     fi
-    
+
     echo "✅ Dataset built successfully"
-    
+
     # Compress and upload
     echo "Compressing dataset..."
     tar -I pigz -cf "$LOCAL_CACHE/${DATASET_NAME}.tar.gz" -C "$LOCAL_CACHE" "${DATASET_NAME}/"
-    
+
     echo "Uploading compressed dataset..."
     gsutil -m cp "$LOCAL_CACHE/${DATASET_NAME}.tar.gz" "gs://$GCS_BUCKET/datasets/"
-    
+
     echo "Cleaning up compressed file..."
     rm "$LOCAL_CACHE/${DATASET_NAME}.tar.gz"
-    
+
     echo "✅ Dataset uploaded to GCS"
 fi
+
+# Download JEPA checkpoint from GCS
+echo "📥 Downloading JEPA checkpoint..."
+mkdir -p "$JEPA_CHECKPOINT_LOCAL"
+gsutil -m cp "gs://$GCS_BUCKET/${JEPA_CHECKPOINT_GCS}/*.pt" "$JEPA_CHECKPOINT_LOCAL/"
+gsutil -m cp "gs://$GCS_BUCKET/${JEPA_CHECKPOINT_GCS}/config.yaml" "$JEPA_CHECKPOINT_LOCAL/"
+
+if [ ! -f "$JEPA_CHECKPOINT_LOCAL/sensor_projection.pt" ]; then
+    echo "❌ JEPA checkpoint missing sensor_projection.pt"
+    ls -la "$JEPA_CHECKPOINT_LOCAL/"
+    exit 1
+fi
+echo "✅ JEPA checkpoint downloaded"
 
 # Continue with training
 cd ~/${PROJECT_NAME}
 
 # Train.
 
-echo "🔥 Starting training..."
+echo "🔥 Starting actuator training..."
 echo "GPU Info:"
 nvidia-smi
 
 cd ~/${PROJECT_NAME}
 
-uv run accelerate launch training/train_action_vae.py 
-
-TRAIN_EXIT_CODE=$?
+uv run accelerate launch training/train_actuator.py \
+    training.dataset_name=action_dataset \
+    training.jepa_checkpoint=${JEPA_CHECKPOINT_LOCAL}
 
 echo "✅ Training completed!"
 
 # Upload to GCS (runs on the remote instance where files exist)
 
-if [ $TRAIN_EXIT_CODE -eq 0 ]; then
-    echo "📤 Uploading to GCS..."
-    
-    if [ -d "data/out" ]; then
-        gsutil -m cp -r data/out/ gs://$GCS_BUCKET/training/action-model/$(date +%Y%m%d_%H%M%S)/
-        echo "✅ Upload complete"
-    else
-        echo "❌ No outputs found"
-    fi
+echo "📤 Uploading to GCS..."
+
+if [ -d "data/out" ]; then
+    gsutil -m cp -r data/out/ gs://$GCS_BUCKET/training/actuator-model/$(date +%Y%m%d_%H%M%S)/
+    echo "✅ Upload complete"
+else
+    echo "❌ No outputs found"
 fi
 
 EOF
@@ -348,7 +360,6 @@ scp -o BatchMode=yes -o StrictHostKeyChecking=accept-new -i $SSH_PATH \
 # Clean up local setup script
 rm -f setup_and_train.sh
 
-# Pass GCS_BUCKET as third argument
 ssh -o BatchMode=yes -o StrictHostKeyChecking=accept-new -i $SSH_PATH \
     ubuntu@${INSTANCE_IP} \
     "chmod +x setup_and_train.sh && ./setup_and_train.sh \
@@ -356,8 +367,10 @@ ssh -o BatchMode=yes -o StrictHostKeyChecking=accept-new -i $SSH_PATH \
     ${WANDB_API_KEY} \
     ${GCS_BUCKET} \
     ${LOCAL_CACHE} \
-    ${DATASET_NAME}"
+    ${DATASET_NAME} \
+    ${JEPA_CHECKPOINT_GCS} \
+    ${JEPA_CHECKPOINT_LOCAL}"
 
-echo "🎉 Training job completed!"
+echo "🎉 Actuator training job completed!"
 
 # Note: cleanup will run automatically due to the trap

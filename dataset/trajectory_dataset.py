@@ -4,29 +4,17 @@ import shutil
 import logging
 import itertools
 from pathlib import Path
-from typing import Callable, Dict, Optional, Union, List, Tuple
-
-
-import datasets
-import hydra
-from omegaconf import DictConfig, OmegaConf
-from datasets import concatenate_datasets, load_dataset
-import numpy as np
-from pathlib import Path
-from typing import Callable, Dict, Optional, Union, List, Tuple
+from typing import Callable, Dict, Union, List
 
 import hydra
+import torch
 import datasets
 import numpy as np
 import polars as pl
 from torch.utils.data import Dataset
-from omegaconf import DictConfig, OmegaConf
-from datasets import concatenate_datasets, load_dataset
-
-import polars as pl
-from torch.utils.data import Dataset
-
 from transformers import AutoTokenizer
+from omegaconf import DictConfig, OmegaConf
+from datasets import concatenate_datasets, load_dataset
 
 
 logger = logging.getLogger(__name__)
@@ -48,8 +36,15 @@ class TrajectoryDataset(Dataset):
         self.stats = stats
         self.tokenizer = tokenizer
 
-    def __getitem__(self, index):
-        return super().__getitem__(index)
+    def __getitem__(self, index) -> Dict[str, list]:
+        data = self.data[index]
+
+        return {
+            "action_tokens": data["action_tokens"],
+            "precept_tokens": data["precept_tokens"],
+            "total_action_tokens": sum(data["action_tokens_length"]),
+            "total_precept_tokens": sum(data["precept_tokens_length"]),
+        }
 
     def __len__(self) -> int:
         return len(self.data)
@@ -75,7 +70,10 @@ class TrajectoryDataset(Dataset):
             debug=config.debug,
         )
 
-        datasets = cls.conform_example_format(datasets)
+        datasets = cls.conform_example_format(
+            datasets,
+            null_symbol="~",
+        )
 
         dataset = concatenate_datasets(datasets)
 
@@ -103,22 +101,6 @@ class TrajectoryDataset(Dataset):
             max_precept_len=config.max_precept_len,
         )
 
-        dataset = cls.add_null_steps(
-            dataset,
-            column="action_tokens",
-            length=config.max_action_len,
-            token_id=100,
-        )
-
-        dataset = cls.add_null_steps(
-            dataset,
-            column="precept_tokens",
-            length=config.max_precept_len,
-            token_id=100,
-        )
-
-        assert False
-
         dataset = cls.pad_and_mask(
             dataset,
             pad=config.pad,
@@ -139,27 +121,13 @@ class TrajectoryDataset(Dataset):
 
         dataset = cls.flatten_tajectories(dataset)
 
-        dataset = cls.pad_trajectories(
-            dataset,
-            column="action_tokens",
-            step_len=config.max_action_len,
-            pad_token_id=tokenizer.pad_token_id,
-        )
-
-        dataset = cls.pad_trajectories(
-            dataset,
-            column="precept_tokens",
-            step_len=config.max_precept_len,
-            pad_token_id=tokenizer.pad_token_id,
-        )
-
-        dataset = dataset.remove_columns(["actions", "prepcets"])
+        dataset = dataset.remove_columns(["actions", "precepts"])
 
         dataset = dataset.flatten_indices()
 
         stats = cls.get_stats(dataset)
 
-        cls(
+        return cls(
             config=config,
             data=dataset,
             stats=stats,
@@ -221,6 +189,7 @@ class TrajectoryDataset(Dataset):
     @staticmethod
     def conform_example_format(
         datasets: List[datasets.Dataset],
+        null_symbol: str,
     ) -> List[datasets.Dataset]:
 
         def conform_toucan(examples):
@@ -238,22 +207,32 @@ class TrajectoryDataset(Dataset):
                 actions_traj = []
                 precept_traj = []
 
+                # Skip traces that don't start with system → user
+                if (
+                    len(msg_trace) < 2
+                    or msg_trace[0]["role"] != "system"
+                    or msg_trace[1]["role"] != "user"
+                ):
+                    actions.append([])
+                    precepts.append([])
+                    traj_lens.append([])
+                    example_ids.append([])
+                    continue
+
                 while msg_idx < len(msg_trace):
 
                     # System prompt
                     if msg_idx == 0:
-                        assert msg_trace[msg_idx]["role"] == "system"
                         precept_traj.append(msg_trace[msg_idx]["content"])
-                        actions_traj.append("")
+                        actions_traj.append(null_symbol)
                         msg_idx += 1
 
                     # User prompt
                     elif msg_idx == 1:
-                        assert msg_trace[msg_idx]["role"] == "user"
                         precept_traj.append(msg_trace[msg_idx]["content"])
 
-                        if msg_idx + 1 > len(msg_trace):
-                            actions_traj.append("")
+                        if msg_idx + 1 >= len(msg_trace):
+                            actions_traj.append(null_symbol)
 
                         msg_idx += 1
 
@@ -267,10 +246,12 @@ class TrajectoryDataset(Dataset):
                             if msg_trace[msg_idx]["content"] != "":
                                 actions_traj.append(msg_trace[msg_idx]["content"])
                                 msg_idx += 1
-                            else:
+                            elif "function_call" in msg_trace[msg_idx] and msg_trace[msg_idx]["function_call"] != "":
                                 func_calls = []
                                 while (
-                                    msg_trace[msg_idx]["role"] == "assistant"
+                                    msg_idx < len(msg_trace)
+                                    and msg_trace[msg_idx]["role"] == "assistant"
+                                    and "function_call" in msg_trace[msg_idx]
                                     and msg_trace[msg_idx]["function_call"] != ""
                                 ):
                                     func_calls.append(
@@ -278,35 +259,39 @@ class TrajectoryDataset(Dataset):
                                     )
                                     msg_idx += 1
                                 actions_traj.append("".join(func_calls))
+                            else:
+                                # Empty content, no function_call — skip
+                                msg_idx += 1
 
                         else:  # len(precepts_traj) == len(action_traj)
 
                             # Add precepts.
                             if msg_trace[msg_idx]["role"] == "function":
                                 func_resps = []
-                                while msg_trace[msg_idx]["role"] == "function":
+                                while msg_idx < len(msg_trace) and msg_trace[msg_idx]["role"] == "function":
                                     func_resps.append(msg_trace[msg_idx]["content"])
                                     msg_idx += 1
                                 precept_traj.append("".join(func_resps))
 
-                                if msg_idx + 1 > len(msg_trace):
-                                    actions_traj.append("")
+                                if msg_idx >= len(msg_trace):
+                                    actions_traj.append(null_symbol)
 
                             # Add actions, infill precepts.
                             elif msg_trace[msg_idx]["role"] == "assistant":
-                                while msg_trace[msg_idx]["role"] == "assistant":
+                                while msg_idx < len(msg_trace) and msg_trace[msg_idx]["role"] == "assistant":
                                     if msg_trace[msg_idx]["content"] != "":
                                         actions_traj.append(
                                             msg_trace[msg_idx]["content"]
                                         )
-                                        precept_traj.append("")
+                                        precept_traj.append(null_symbol)
                                         msg_idx += 1
-                                    else:
+                                    elif "function_call" in msg_trace[msg_idx] and msg_trace[msg_idx]["function_call"] != "":
                                         func_calls = []
                                         while (
-                                            msg_trace[msg_idx]["role"] == "assistant"
-                                            and msg_trace[msg_idx]["function_call"]
-                                            != ""
+                                            msg_idx < len(msg_trace)
+                                            and msg_trace[msg_idx]["role"] == "assistant"
+                                            and "function_call" in msg_trace[msg_idx]
+                                            and msg_trace[msg_idx]["function_call"] != ""
                                         ):
                                             func_calls.append(
                                                 json.dumps(
@@ -315,22 +300,37 @@ class TrajectoryDataset(Dataset):
                                             )
                                             msg_idx += 1
                                         actions_traj.append("".join(func_calls))
-                                        precept_traj.append("")
+                                        precept_traj.append(null_symbol)
+                                    else:
+                                        # Empty content, no function_call — skip
+                                        msg_idx += 1
+
+                            # Follow-up user message — new precept.
+                            elif msg_trace[msg_idx]["role"] == "user":
+                                precept_traj.append(msg_trace[msg_idx]["content"])
+                                msg_idx += 1
+
+                                if msg_idx >= len(msg_trace):
+                                    actions_traj.append(null_symbol)
 
                             else:
-                                raise ValueError("Multi-turn traces not supported yet.")
+                                raise ValueError(
+                                    f"Unexpected role '{msg_trace[msg_idx]['role']}' at msg_idx={msg_idx}"
+                                )
 
-                    if len(actions_traj) == len(precept_traj):
-                        example_ids.append(examples["uuid"][idx])
+                # Append terminal step: null precept, "done" action
+                precept_traj.append(null_symbol)
+                actions_traj.append("done")
 
                 actions.append(actions_traj)
                 precepts.append(precept_traj)
                 traj_lens.append(len(actions_traj) * [len(actions_traj)])
+                example_ids.append(len(actions_traj) * [examples["uuid"][idx]])
 
             examples["actions"] = list(itertools.chain.from_iterable(actions))
             examples["precepts"] = list(itertools.chain.from_iterable(precepts))
             examples["num_steps"] = list(itertools.chain.from_iterable(traj_lens))
-            examples["example_ids"] = example_ids
+            examples["example_ids"] = list(itertools.chain.from_iterable(example_ids))
 
             return examples
 
@@ -378,12 +378,15 @@ class TrajectoryDataset(Dataset):
                 tokenized.append(
                     tokenizer(
                         sequence_list,
-                        add_special_tokens=False,
+                        add_special_tokens=True,
                         **kwargs,
                     )
                 )
 
-            examples[dst_columns["tokens"]] = [item["input_ids"] for item in tokenized]
+            eos_id = tokenizer.eos_token_id
+            examples[dst_columns["tokens"]] = [
+                item["input_ids"] + [eos_id] for item in tokenized
+            ]
 
             if "mask" in dst_columns:
                 examples[dst_columns["mask"]] = [
@@ -442,38 +445,6 @@ class TrajectoryDataset(Dataset):
         return filtered_dataset
 
     @staticmethod
-    def add_null_steps(
-        dataset: datasets.Dataset,
-        column: str,
-        length: int,
-        null_token_id: int,
-    ) -> datasets.Dataset:
-
-        os.makedirs("temp_df", exist_ok=True)
-
-        (
-            pl.from_arrow(dataset.data.table)
-            .lazy()
-            .with_columns(
-                pl.when(pl.col(column).list.len() == 0)
-                .then(length * [null_token_id])
-                .otherwise(pl.col(column))
-                .name.keep()
-            )
-            .sink_parquet("temp_df/df.parquet")
-        )
-
-        dataset = load_dataset(
-            "parquet",
-            data_files="temp_df/df.parquet",
-            split="train",
-        )
-
-        shutil.rmtree("temp_df")
-
-        return dataset
-
-    @staticmethod
     def pad_and_mask(
         dataset: datasets.Dataset,
         pad: bool,
@@ -530,7 +501,8 @@ class TrajectoryDataset(Dataset):
             .agg(pl.all())
             .with_columns(
                 pl.col("num_steps").list.first(),
-                pl.col("action_tokens_length").list.sum(),
+                # pl.col("action_tokens_length").list.sum(),
+                # pl.col("precept_tokens_length").list.sum(),
             )
             .sink_parquet("temp_flattened/flat_trajectory.parquet")
         )
@@ -546,44 +518,54 @@ class TrajectoryDataset(Dataset):
         return dataset
 
     @staticmethod
-    def pad_trajectories(
-        dataset: datasets.Dataset,
-        column: str,
-        step_len: int,
-        pad_token_id: int,
-    ) -> datasets.Dataset:
+    def get_stats(dataset: datasets.Dataset) -> datasets.Dataset:
+        action_tokens_length = np.concatenate(
+            [np.array(i) for i in dataset["action_tokens_length"]]
+        )
+        precept_tokens_length = np.concatenate(
+            [np.array(i) for i in dataset["precept_tokens_length"]]
+        )
+        trajectory_lengths = np.array(dataset["num_steps"])
 
-        padded_trajectories = []
-        attention_masks = []
-        max_len = np.array(dataset["num_steps"]).max()
+        # Exclude null sequences
+        action_tokens_length = action_tokens_length[action_tokens_length > 2]
+        precept_tokens_length = precept_tokens_length[precept_tokens_length > 2]
 
-        def _pad_fn(examples):
+        action_quantiles = np.percentile(action_tokens_length, [25, 50, 75, 95, 99])
+        precept_quantiles = np.percentile(precept_tokens_length, [25, 50, 75, 95, 99])
+        trajectory_quantiles = np.percentile(trajectory_lengths, [25, 50, 75, 95, 99])
 
-            for trajectory in examples[column]:
-                length = len(trajectory)
-                padded_trajectories.append(
-                    trajectory
-                    + [step_len * [pad_token_id] for _ in range(max_len - length)]
-                )
-                attention_masks.append([1] * length + [0] * (max_len - length))
+        mapping = {
+            "action": {
+                "lengths": action_tokens_length,
+                "quantiles": action_quantiles,
+            },
+            "precept": {
+                "lengths": precept_tokens_length,
+                "quantiles": precept_quantiles,
+            },
+            "trajectory": {
+                "lengths": trajectory_quantiles,
+                "quantiles": trajectory_quantiles,
+            },
+        }
 
-            return {
-                column: padded_trajectories,
-                column + "_tajectory_mask": attention_masks,
+        stats = {}
+
+        for key, val in mapping.items():
+            stats[key] = {
+                "mean": float(val["lengths"].mean()),
+                "std": float(val["lengths"].std()),
+                "min": int(val["lengths"].min()),
+                "max": int(val["lengths"].max()),
+                "q25": float(val["quantiles"][0]),
+                "q50": float(val["quantiles"][1]),
+                "q75": float(val["quantiles"][2]),
+                "q95": float(val["quantiles"][3]),
+                "q99": float(val["quantiles"][4]),
             }
 
-        return dataset.map(
-            _pad_fn,
-            batched=True,
-            batch_size=1000,
-            num_proc=8,
-            remove_columns=None,
-            desc=f"Padding trajectories for {column}...",
-        )
-
-    @classmethod
-    def get_stats(dataset: datasets.Dataset) -> datasets.Dataset:
-        pass
+        return stats
 
     def save(self, tgt_dir: Union[str, Path]) -> None:
         tgt_dir = Path(tgt_dir)
@@ -642,12 +624,13 @@ def main(cfg: DictConfig):
     OmegaConf.resolve(cfg)
 
     dataset = TrajectoryDataset.build_dataset(config=cfg.dataset)
-    # dataset.save(
-    #     tgt_dir=Path(
-    #         cfg.training.cache_dir,
-    #         cfg.training.dataset_name,
-    #     )
-    # )
+
+    dataset.save(
+        tgt_dir=Path(
+            cfg.training.cache_dir,
+            cfg.training.dataset_name,
+        )
+    )
 
 
 if __name__ == "__main__":

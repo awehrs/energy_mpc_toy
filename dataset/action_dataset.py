@@ -39,7 +39,7 @@ class ActionDataset(Dataset):
         }
 
     def __len__(self) -> int:
-        return len(self.data)
+        return len(self.data["action_tokens"])
 
     @classmethod
     def build_dataset(
@@ -400,8 +400,18 @@ class ActionDataset(Dataset):
         with open(src_dir / "config.yaml", "r") as f:
             config = OmegaConf.load(f)
 
-        # Load data
-        data = datasets.load_from_disk(str(src_dir / "data"))
+        # Load data into RAM and convert to plain Python lists (bypass Arrow overhead)
+        import time as _time
+        print("Loading HuggingFace dataset...")
+        hf_data = datasets.load_from_disk(str(src_dir / "data"), keep_in_memory=True)
+        print("Converting to Python lists (this takes ~30s but makes training fast)...")
+        t0 = _time.time()
+        data = {
+            "action_tokens": list(hf_data["action_tokens"]),
+            "attention_mask": list(hf_data["attention_mask"]),
+            "token_length": list(hf_data["token_length"]),
+        }
+        print(f"Converted {len(data['action_tokens'])} samples in {_time.time()-t0:.1f}s")
 
         # Load stats.
         with open(src_dir / "stats.json", "r") as f:

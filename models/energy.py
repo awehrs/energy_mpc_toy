@@ -4,7 +4,7 @@ import torch.nn as nn
 from models.attention import Attention
 
 
-class EnergyModel(nn.Module):
+class Energy(nn.Module):
     """
     Transformer-based Energy Model that evaluates latent representation quality.
     Assigns low energy to latents that contain sufficient task-relevant information.

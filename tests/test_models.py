@@ -8,9 +8,9 @@ import os
 from models.action_projector import ActionProjection
 from models.actuators import Decoder
 from models.sensors import Encoder
-from models.energy_model import EnergyModel
-from models.dynamics_model import ForwardModel
-from models.flow_model import Model
+from models.energy import EnergyModel
+from models.predictor import ForwardModel
+from models.policy import Model
 
 
 @pytest.mark.parametrize("batch_size,latent_len,latent_dim", [(2, 10, 256)])

@@ -2,16 +2,16 @@
 source .env
 
 # Configuration
-INSTANCE_TYPE=gpu_1x_h100_pcie #gpu_8x_a100_80gb_sxm4 
+INSTANCE_TYPE=gpu_1x_h100_pcie #gpu_8x_a100_80gb_sxm4
 SSH_NAME=scoobdoob
 SSH_PATH=~/.ssh/scoobdoob.pem
 GCS_BUCKET=energy-mpc
 LOCAL_CACHE=/tmp/datasets
-DATASET_NAME=action_dataset
+DATASET_NAME=trajectory_dataset
 PROJECT_NAME=energy_mpc_toy
 
 
-echo "🚀 Setting up action VAE training on Lambda Labs..."
+echo "🚀 Setting up JEPA training on Lambda Labs..."
 
 
 MAX_TRIES=500
@@ -79,7 +79,7 @@ for attempt in $(seq 1 $MAX_LAUNCH_RETRIES); do
     
     if [ $attempt -lt $MAX_LAUNCH_RETRIES ]; then
         echo "   Waiting 30s before retry..."
-        sleep 30s
+        sleep 30
         
         # Refresh region availability for retry
         echo "   Checking for new capacity..."
@@ -111,6 +111,23 @@ if [ "$INSTANCE_ID" = "null" ] || [ "$INSTANCE_ID" = "" ]; then
     exit 1
 fi
 
+# Setup cleanup trap immediately after instance is created
+cleanup() {
+    echo "🧹 Cleaning up..."
+    rm -f lambda-config.json
+
+    if [ ! -z "$INSTANCE_ID" ]; then
+        echo "🛑 Terminating instance $INSTANCE_ID..."
+        curl -s -u "$LAMBDA_LABS_API_KEY": \
+            https://cloud.lambdalabs.com/api/v1/instance-operations/terminate \
+            -d "{\"instance_ids\": [\"$INSTANCE_ID\"]}" \
+            -H "Content-Type: application/json" > /dev/null
+        echo "✅ Instance terminated"
+    fi
+}
+
+trap cleanup EXIT
+
 # Wait for instance to be ready
 echo "⏳ Waiting for instance to be ready..."
 sleep 3m
@@ -122,18 +139,18 @@ MAX_IP_RETRIES=50
 
 for attempt in $(seq 1 $MAX_IP_RETRIES); do
     echo "   IP attempt $attempt/$MAX_IP_RETRIES..."
-    
+
     IP_RESPONSE=$(curl -s -u $LAMBDA_LABS_API_KEY: https://cloud.lambdalabs.com/api/v1/instances/${INSTANCE_ID})
     INSTANCE_IP=$(echo $IP_RESPONSE | jq -r '.data.ip')
-    
+
     if [ "$INSTANCE_IP" != "null" ] && [ "$INSTANCE_IP" != "" ]; then
         echo "✅ Instance IP: $INSTANCE_IP"
         break
     fi
-    
+
     if [ $attempt -lt $MAX_IP_RETRIES ]; then
         echo "   No IP yet, waiting 20s..."
-        sleep 20s
+        sleep 20
     fi
 done
 
@@ -153,17 +170,17 @@ MAX_SSH_RETRIES=100
 
 for attempt in $(seq 1 $MAX_SSH_RETRIES); do
     echo "   SSH attempt $attempt/$MAX_SSH_RETRIES..."
-    
+
     if ssh -o BatchMode=yes -o StrictHostKeyChecking=accept-new -o ConnectTimeout=15 \
            -i $SSH_PATH ubuntu@${INSTANCE_IP} 'echo "SSH ready"' >/dev/null 2>&1; then
         echo "✅ SSH connection successful"
         SSH_READY=true
         break
     fi
-    
+
     if [ $attempt -lt $MAX_SSH_RETRIES ]; then
-        echo "   SSH not ready, waiting 30s..."
-        sleep 30s
+        echo "   SSH not ready, waiting 30..."
+        sleep 30
     fi
 done
 
@@ -174,29 +191,9 @@ if [ "$SSH_READY" = false ]; then
     exit 1
 fi
 
-# Setup cleanup trap
-cleanup() {
-    echo "🧹 Cleaning up..."
-    rm -f lambda-config.json
-    
-    if [ ! -z "$INSTANCE_ID" ]; then
-        echo "🛑 Terminating instance $INSTANCE_ID..."
-        curl -s -u "$LAMBDA_LABS_API_KEY": \
-            https://cloud.lambdalabs.com/api/v1/instance-operations/terminate \
-            -d "{\"instance_ids\": [\"$INSTANCE_ID\"]}" \
-            -H "Content-Type: application/json" > /dev/null
-        echo "✅ Instance terminated"
-    fi
-}
-
-# Set trap for cleanup on exit
-trap cleanup EXIT
-
 # Sync project code
 cp ~/.config/gcloud/servicekey.json ./servicekey.json
 
-# Add to gitignore
-echo "servicekey.json" >> .gitignore
 echo "📁 Syncing project code..."
 rsync -av --progress \
     --exclude='.git' \
@@ -219,7 +216,6 @@ echo "⚙️  Setting up environment and starting training..."
 
 cat > setup_and_train.sh << 'EOF'
 #!/bin/bash
-set -e
 
 PROJECT_NAME=$1
 WANDB_API_KEY=$2
@@ -243,6 +239,7 @@ cd ~/${PROJECT_NAME}
 # Sync all dependencies (creates .venv and installs everything from pyproject.toml)
 uv sync
 MAX_JOBS=$(nproc) uv pip install flash-attn --no-build-isolation
+MAX_JOBS=$(nproc) uv pip install flash-linear-attention
 
 # Set environment variables
 export GOOGLE_APPLICATION_CREDENTIALS="./servicekey.json"
@@ -286,26 +283,28 @@ else
     # Build locally if not in GCS
     echo "Dataset not in GCS, building locally..."
     cd ~/${PROJECT_NAME}
-    uv run python dataset/action_dataset.py
-    
+    uv run python dataset/trajectory_dataset.py \
+        training.dataset_name=${DATASET_NAME} \
+        training.cache_dir=${LOCAL_CACHE}
+
     # Check if build succeeded
     if [ ! -d "$LOCAL_CACHE/$DATASET_NAME" ]; then
         echo "❌ Dataset build failed - directory not found at $LOCAL_CACHE/$DATASET_NAME"
         exit 1
     fi
-    
+
     echo "✅ Dataset built successfully"
-    
+
     # Compress and upload
     echo "Compressing dataset..."
     tar -I pigz -cf "$LOCAL_CACHE/${DATASET_NAME}.tar.gz" -C "$LOCAL_CACHE" "${DATASET_NAME}/"
-    
+
     echo "Uploading compressed dataset..."
     gsutil -m cp "$LOCAL_CACHE/${DATASET_NAME}.tar.gz" "gs://$GCS_BUCKET/datasets/"
-    
+
     echo "Cleaning up compressed file..."
     rm "$LOCAL_CACHE/${DATASET_NAME}.tar.gz"
-    
+
     echo "✅ Dataset uploaded to GCS"
 fi
 
@@ -320,23 +319,21 @@ nvidia-smi
 
 cd ~/${PROJECT_NAME}
 
-uv run accelerate launch training/train_action_vae.py 
-
-TRAIN_EXIT_CODE=$?
+PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+uv run accelerate launch training/train_jepa.py \
+    training.dataset_name=trajectory_dataset
 
 echo "✅ Training completed!"
 
 # Upload to GCS (runs on the remote instance where files exist)
 
-if [ $TRAIN_EXIT_CODE -eq 0 ]; then
-    echo "📤 Uploading to GCS..."
-    
-    if [ -d "data/out" ]; then
-        gsutil -m cp -r data/out/ gs://$GCS_BUCKET/training/action-model/$(date +%Y%m%d_%H%M%S)/
-        echo "✅ Upload complete"
-    else
-        echo "❌ No outputs found"
-    fi
+echo "📤 Uploading to GCS..."
+
+if [ -d "data/out" ]; then
+    gsutil -m cp -r data/out/ gs://$GCS_BUCKET/training/jepa-model/$(date +%Y%m%d_%H%M%S)/
+    echo "✅ Upload complete"
+else
+    echo "❌ No outputs found"
 fi
 
 EOF

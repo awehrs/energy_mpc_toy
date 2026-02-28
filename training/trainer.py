@@ -19,7 +19,7 @@ torch._dynamo.config.optimize_ddp = False
 
 warnings.filterwarnings("ignore", message=".*Mismatch dtype between input and weight.*")
 
-os.environ["PYTORCH_ALLOC_CONF"] = "max_split_size_mb:512"
+os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 
 try:
     import wandb
@@ -37,7 +37,7 @@ except ImportError:
     GPUTIL_AVAILABLE = False
     GPUtil = None
 
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(level=logging.DEBUG)
 logger = logging.getLogger(__name__)
 
 
@@ -108,6 +108,8 @@ class AccelerateTrainer:
 
         self._param_counts = {"total": total_params, "trainable": trainable_params}
         self.accelerator = Accelerator(**kwargs)
+
+        self.accelerator.even_batches = config.even_batches
 
         print(f"=" * 80)
         print(f"Rank {self.accelerator.process_index}:")
@@ -223,8 +225,8 @@ class AccelerateTrainer:
         if self.accelerator.is_main_process:
             Path(config.output_dir).mkdir(parents=True, exist_ok=True)
 
-    def _compile(self) -> None:
-        self.model = torch.compile(
+    def _compile(self):
+        return torch.compile(
             self.model,
             mode=self.config.torch_compile_mode,
         )
@@ -312,45 +314,60 @@ class AccelerateTrainer:
         ), "Cannot use both sampler and batch_sampler"
 
         if batch_sampler:
-            return DataLoader(
-                dataset,
-                batch_sampler=batch_sampler,
-                collate_fn=collate_fn,
-                num_workers=0,
-                pin_memory=(
+            num_workers = self.config.dataloader_num_workers
+            loader_kwargs = {
+                "dataset": dataset,
+                "batch_sampler": batch_sampler,
+                "collate_fn": collate_fn,
+                "num_workers": num_workers,
+                "pin_memory": (
                     self.config.dataloader_pin_memory
                     if torch.cuda.is_available()
                     else False
                 ),
-            )
+            }
+            if num_workers > 0:
+                loader_kwargs["persistent_workers"] = True
+                loader_kwargs["prefetch_factor"] = 8
+            return DataLoader(**loader_kwargs)
         elif sampler:
-            return DataLoader(
-                dataset,
-                batch_size=self._get_batch_size(is_train),
-                sampler=sampler,
-                collate_fn=collate_fn,
-                num_workers=self.config.dataloader_num_workers,
-                pin_memory=(
+            num_workers = self.config.dataloader_num_workers
+            loader_kwargs = {
+                "dataset": dataset,
+                "batch_size": self._get_batch_size(is_train),
+                "sampler": sampler,
+                "collate_fn": collate_fn,
+                "num_workers": num_workers,
+                "pin_memory": (
                     self.config.dataloader_pin_memory
                     if torch.cuda.is_available()
                     else False
                 ),
-            )
+            }
+            if num_workers > 0:
+                loader_kwargs["persistent_workers"] = True
+                loader_kwargs["prefetch_factor"] = 8
+            return DataLoader(**loader_kwargs)
         else:
             # Standard dataloader
-            return DataLoader(
-                dataset,
-                batch_size=self._get_batch_size(is_train),
-                shuffle=is_train,
-                collate_fn=collate_fn,
-                num_workers=self.config.dataloader_num_workers,
-                pin_memory=(
+            num_workers = self.config.dataloader_num_workers
+            loader_kwargs = {
+                "dataset": dataset,
+                "batch_size": self._get_batch_size(is_train),
+                "shuffle": is_train,
+                "collate_fn": collate_fn,
+                "num_workers": num_workers,
+                "pin_memory": (
                     self.config.dataloader_pin_memory
                     if torch.cuda.is_available()
                     else False
                 ),
-                drop_last=is_train,
-            )
+                "drop_last": is_train,
+            }
+            if num_workers > 0:
+                loader_kwargs["persistent_workers"] = True
+                loader_kwargs["prefetch_factor"] = 8
+            return DataLoader(**loader_kwargs)
 
     def _get_batch_size(self, is_train=True) -> int:
         """Get batch size for train/eval."""
@@ -507,114 +524,41 @@ class AccelerateTrainer:
                 if hasattr(sampler, "set_epoch"):
                     sampler.set_epoch(epoch)
 
-            for batch in self.train_dataloader:
-
+            logger.info(f"[epoch {epoch}] Starting dataloader iteration...")
+            for batch_idx, batch in enumerate(self.train_dataloader):
+                logger.info(f"[step {self.global_step}] Got batch {batch_idx}")
                 with self.accelerator.accumulate(self.model):
-
-                    # Forward pass
-                    with self.accelerator.autocast():
-                        fwd_start = time.time()
-                        loss, additional_metrics = self._compute_loss(batch)
-                        timer.update_fwd(time.time() - fwd_start)
-
-                    # Backward pass
-                    bwd_start = time.time()
-                    self.accelerator.backward(loss)
-                    timer.update_bwd(time.time() - bwd_start)
-
-                    # Gradient clipping
-                    if self.config.max_grad_norm is not None:
-                        grad_norm = self.accelerator.clip_grad_norm_(
-                            self.model.parameters(), self.config.max_grad_norm
-                        )
-                    else:
-                        grad_norm = 0
-
-                    # Optimizer step
-                    self.optimizer.step()
-                    self.lr_scheduler.step()
-                    self.optimizer.zero_grad()
-                    # torch.cuda.empty_cache()
+                    loss, additional_metrics, grad_norm = self.train_micro_step(
+                        batch=batch,
+                        timer=timer,
+                    )
+                logger.info(f"[step {self.global_step}] Micro-step done")
 
                 # Accumulate loss (only log on accumulation boundary)
-                total_loss += loss.detach().float()
+                total_loss += loss.detach()
 
                 # Only log/save on accumulation boundaries
                 if self.accelerator.sync_gradients:
+                    self.on_optimizer_step_end()
 
-                    # Logging
-                    if self.global_step % self.config.logging_steps == 0:
+                    self.on_step_end(
+                        epoch=epoch,
+                        loss=loss,
+                        total_loss=total_loss,
+                        additional_metrics=additional_metrics,
+                        grad_norm=grad_norm,
+                        timer=timer,
+                        start_time=start_time,
+                    )
 
-                        allocated = torch.cuda.memory_allocated() / 1e9
-                        max_allocated = torch.cuda.max_memory_allocated() / 1e9
-                        reserved = torch.cuda.memory_reserved() / 1e9
-
-                        if self.global_step % 100 == 0:
-                            torch.cuda.reset_peak_memory_stats()
-
-                        current_time = time.time()
-                        elapsed = current_time - start_time
-                        steps_per_sec = (
-                            self.config.logging_steps / elapsed if elapsed > 0 else 0
-                        )
-
-                        # Average loss over accumulation steps
-                        avg_loss = total_loss / self.config.gradient_accumulation_steps
-
-                        metrics = {
-                            "train_loss": avg_loss.item(),
-                            "learning_rate": self.lr_scheduler.get_last_lr()[0],
-                            "grad_norm": (
-                                grad_norm.item()
-                                if hasattr(grad_norm, "item")
-                                else grad_norm
-                            ),
-                            "allocated_memory": allocated,
-                            "max_allocated_memory": max_allocated,
-                            "reserved_memory": reserved,
-                            "steps_per_sec": steps_per_sec,
-                            "forward_time": timer.fwd_avg,
-                            "backward_time": timer.bwd_avg,
-                            "epoch": epoch,
-                            **additional_metrics,
-                        }
-
-                        self._log_metrics(metrics, self.global_step)
-                        start_time = current_time
+                    # Update local timing anchor if logging happened inside on_step_end
+                    start_time = (
+                        self._step_end_start_time
+                        if hasattr(self, "_step_end_start_time")
+                        else start_time
+                    )
 
                     total_loss = 0
-
-                    # Evaluation
-                    if (
-                        self.eval_dataloader is not None
-                        and self.global_step > 0
-                        and self.config.eval_steps > 0
-                        and self.global_step % self.config.eval_steps == 0
-                    ):
-                        logging.info("Beginning evaluation...")
-
-                        eval_metrics = self.eval_fn(self.eval_dataloader)
-                        eval_metrics = {
-                            f"eval_{k}" if not k.startswith("eval_") else k: v
-                            for k, v in eval_metrics.items()
-                        }
-                        self._log_metrics(eval_metrics, self.global_step)
-
-                        # Save best model
-                        eval_loss = eval_metrics.get("eval_loss", float("inf"))
-                        if eval_loss < self.best_eval_loss:
-                            self.best_eval_loss = eval_loss
-                            self.save_checkpoint(self.global_step, is_best=True)
-
-                        self.model.train()
-
-                    # Save checkpoint
-                    if (
-                        self.global_step > 0
-                        and self.global_step % self.config.save_steps == 0
-                    ):
-                        self.save_checkpoint(self.global_step)
-
                     self.global_step += 1
 
                     # Check if we've reached max steps
@@ -642,3 +586,123 @@ class AccelerateTrainer:
             and self.accelerator.is_main_process
         ):
             self.accelerator.end_training()
+
+    def train_micro_step(self, batch, timer):
+        """Runs forward/backward/clip for one micro-batch. No optimizer/scheduler stepping."""
+        # Forward pass
+        with self.accelerator.autocast():
+            fwd_start = time.time()
+            logger.info(f"[step {self.global_step}] Forward start")
+            loss, additional_metrics = self._compute_loss(batch)
+            torch.cuda.synchronize()
+            logger.info(f"[step {self.global_step}] Forward done ({time.time() - fwd_start:.1f}s)")
+            timer.update_fwd(time.time() - fwd_start)
+
+        # Backward pass
+        bwd_start = time.time()
+        logger.info(f"[step {self.global_step}] Backward start")
+        self.accelerator.backward(loss)
+        torch.cuda.synchronize()
+        logger.info(f"[step {self.global_step}] Backward done ({time.time() - bwd_start:.1f}s)")
+        timer.update_bwd(time.time() - bwd_start)
+
+        # Gradient clipping
+        if self.config.max_grad_norm is not None:
+            grad_norm = self.accelerator.clip_grad_norm_(
+                self.model.parameters(), self.config.max_grad_norm
+            )
+        else:
+            grad_norm = 0
+
+        return loss, additional_metrics, grad_norm
+
+    def on_optimizer_step_end(self):
+        """Runs optimizer/scheduler update exactly once per true step."""
+        logger.info(f"[step {self.global_step}] Optimizer step start")
+        self.optimizer.step()
+        self.lr_scheduler.step()
+        self.optimizer.zero_grad()
+        logger.info(f"[step {self.global_step}] Optimizer step done")
+
+    def on_step_end(
+        self,
+        epoch,
+        loss,
+        total_loss,
+        additional_metrics,
+        grad_norm,
+        timer,
+        start_time,
+    ):
+        """Runs logging/eval/save decisions at true step boundaries."""
+        # Logging
+        if self.global_step % self.config.logging_steps == 0:
+
+            allocated = torch.cuda.memory_allocated() / 1e9
+            max_allocated = torch.cuda.max_memory_allocated() / 1e9
+            reserved = torch.cuda.memory_reserved() / 1e9
+
+            if self.global_step % 100 == 0:
+                torch.cuda.reset_peak_memory_stats()
+
+            current_time = time.time()
+            elapsed = current_time - start_time
+            steps_per_sec = self.config.logging_steps / elapsed if elapsed > 0 else 0
+
+            # Average loss over accumulation steps
+            avg_loss = total_loss / self.config.gradient_accumulation_steps
+
+            # Convert any tensor metrics to Python floats
+            resolved_additional = {
+                k: v.item() if hasattr(v, "item") else v
+                for k, v in additional_metrics.items()
+            }
+
+            metrics = {
+                "train_loss": avg_loss.item(),
+                "learning_rate": self.lr_scheduler.get_last_lr()[0],
+                "grad_norm": (
+                    grad_norm.item() if hasattr(grad_norm, "item") else grad_norm
+                ),
+                "allocated_memory": allocated,
+                "max_allocated_memory": max_allocated,
+                "reserved_memory": reserved,
+                "steps_per_sec": steps_per_sec,
+                "forward_time": timer.fwd_avg,
+                "backward_time": timer.bwd_avg,
+                "epoch": epoch,
+                **resolved_additional,
+            }
+
+            self._log_metrics(metrics, self.global_step)
+
+            # Store updated start_time so train() can pick it up without changing signature
+            self._step_end_start_time = current_time
+
+        # Evaluation
+        if (
+            self.eval_dataloader is not None
+            and self.global_step > 0
+            and self.config.eval_steps > 0
+            and self.global_step % self.config.eval_steps == 0
+        ):
+            logging.info("Beginning evaluation...")
+
+            eval_metrics = self.eval_fn(self.eval_dataloader)
+            eval_metrics = {
+                f"eval_{k}" if not k.startswith("eval_") else k: v
+                for k, v in eval_metrics.items()
+            }
+            self._log_metrics(eval_metrics, self.global_step)
+
+            # Save best model
+            eval_loss = eval_metrics.get("eval_loss", float("inf"))
+            if eval_loss < self.best_eval_loss:
+                self.best_eval_loss = eval_loss
+                self.save_checkpoint(self.global_step, is_best=True)
+
+            self.model.train()
+
+        # Save checkpoint
+        if self.global_step > 0 and self.global_step % self.config.save_steps == 0:
+            self.save_checkpoint(self.global_step)

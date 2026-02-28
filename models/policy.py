@@ -6,7 +6,11 @@ import torch
 import torch.nn as nn
 
 
-class FlowModel(nn.Module):
+class Policy(nn.Module):
+    pass
+
+
+class FlowMatchingNetwork(nn.Module):
 
     def __init__(
         self,

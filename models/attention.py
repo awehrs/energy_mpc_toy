@@ -1,5 +1,6 @@
 from typing import Optional, Tuple
 
+import einops
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -372,6 +373,8 @@ class TransformerBlock(nn.Module):
         n_heads: int = 16,
         n_layers: int = 8,
         dropout: float = 0.1,
+        is_causal: int = False,
+        is_cross_attention: int = False,
     ):
         super().__init__()
 
@@ -384,7 +387,11 @@ class TransformerBlock(nn.Module):
                     {
                         "norm1": nn.RMSNorm(d_model),
                         "self_attn": Attention(
-                            d_model=d_model, n_heads=n_heads, dropout=dropout
+                            d_model=d_model,
+                            n_heads=n_heads,
+                            dropout=dropout,
+                            is_causal=is_causal,
+                            is_cross_attention=is_cross_attention,
                         ),
                         "norm2": nn.RMSNorm(d_model),
                         "ffn": MLP(d_model),
@@ -461,3 +468,78 @@ class TransformerBlock(nn.Module):
             hidden_states = hidden_states + residual
 
         return hidden_states
+
+
+class Downsampler(nn.Module):
+    """Perceiver encoder with sequence packing."""
+
+    def __init__(
+        self,
+        d_model: int,
+        n_latents: int = 64,
+        n_heads: int = 8,
+        norm_eps: float = 1e-5,
+    ):
+        super().__init__()
+
+        self.query = nn.Parameter(torch.randn(n_latents, d_model) * 0.02)
+
+        self.cross_attention = Attention(
+            d_model=d_model,
+            n_heads=n_heads,
+            is_causal=False,
+            is_cross_attention=True,
+        )
+
+        self.norm_kv = nn.RMSNorm(d_model, eps=norm_eps)
+
+        self.ffn = MLP(d_model)
+
+        self.norm_out = nn.LayerNorm(d_model, eps=norm_eps)
+
+        self.apply(self._init_weights)
+
+    def _init_weights(self, module: nn.Module):
+        if isinstance(module, nn.Linear):
+            nn.init.normal_(module.weight, mean=0.0, std=0.02)
+            if module.bias is not None:
+                nn.init.zeros_(module.bias)
+        elif isinstance(module, nn.RMSNorm):
+            nn.init.ones_(module.weight)
+
+    def forward(
+        self,
+        embedding: torch.Tensor,
+        max_seq_len: int,
+        cu_seq_lens: torch.Tensor,
+    ) -> torch.Tensor:
+
+        batch_size = len(cu_seq_lens) - 1
+
+        max_seq_len_q = self.query.shape[0]
+
+        cu_seq_lens_q = (
+            torch.arange(
+                len(cu_seq_lens),
+                dtype=torch.int32,
+                device=embedding.device,
+            )
+            * max_seq_len_q
+        )
+
+        query = einops.repeat(
+            self.query, "n_latents dim -> (b n_latents) dim", b=batch_size
+        )
+
+        kv = self.norm_kv(embedding)
+
+        latent = self.cross_attention(
+            query=query,
+            key=kv,
+            max_seq_len_q=max_seq_len_q,
+            max_seq_len_k=max_seq_len,
+            cu_seq_lens_q=cu_seq_lens_q,
+            cu_seq_lens_k=cu_seq_lens,
+        )
+
+        return self.norm_out(self.ffn(latent))

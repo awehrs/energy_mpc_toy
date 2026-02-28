@@ -4,12 +4,12 @@ n_self_attn_heads: ${n_self_attn_heads}
 dropout: ${dropout}
 
 
-# Action autoencoder 
+# Action autoencoder
 action_model:
   d_latent: ${d_latent}
   d_model: 768
   max_action_len: ${max_action_len}
-  n_action_latents: 64
+  n_action_latents: ${n_action_latents}
   n_encoder_self_attn_layers: 8
   n_decoder_self_attn_layers: 8
   n_cross_attn_heads: ${n_cross_attn_heads}
@@ -17,12 +17,20 @@ action_model:
   dropout: ${dropout}
   model_name: ${pretrained_lm}
 
-# Dynamics SSM.
-dynamics_model: 
-  n_precept_latents: 64
-  d_model: 768
-  n_self_attn_layers: 8
-  n_cross_attn_heads: ${n_cross_attn_heads}
-  n_self_attn_heads: ${n_self_attn_heads}
-  dropout: ${dropout}
+# JEPA agent — shared across components
+d_model: ${d_latent}
+n_heads: 8
+n_precept_latents: 64
+n_action_latents: ${n_action_latents}
+norm_eps: 1e-5
+
+sensor:
   model_name: ${pretrained_lm}
+
+memory:
+  n_blocks: 4
+  n_mixer_layers: 2
+
+predictor:
+  n_layers: 4
+

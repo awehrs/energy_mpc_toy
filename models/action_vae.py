@@ -2,10 +2,9 @@ from typing import Dict, Optional
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 from einops import repeat
 from omegaconf import DictConfig
-from jaxtyping import Bool, Int, Int32, Int64, Float
+from jaxtyping import Int, Int32, Int64, Float
 from transformers import Qwen2Config
 from transformers.models.qwen2.modeling_qwen2 import Qwen2RotaryEmbedding
 
@@ -88,40 +87,28 @@ class VariationalEncoder(nn.Module):
     def forward(
         self,
         input_ids: Int[torch.Tensor, "batch seq_len"],
-        max_seq_len: Optional[int] = None,
-        cu_seq_lens: Optional[Int32[torch.Tensor, "batch+1"]] = None,
-        position_ids: Optional[Int64[torch.Tensor, "total_length"]] = None,
-        attn_mask: Optional[Bool[torch.Tensor, "batch seq_len"]] = None,
+        max_seq_len: int,
+        cu_seq_lens: Int32[torch.Tensor, "batch+1"],
+        position_ids: Int64[torch.Tensor, "total_length"],
     ) -> Dict[str, Float[torch.Tensor, "n_latents latent dim"]]:
 
         inputs = self.input_embedding(input_ids)
 
-        if max_seq_len is not None:
-            # Doing sequence packing.
-            batch_size = len(cu_seq_lens) - 1
-            max_seq_len_q = self.query.shape[0]
-            cu_seq_lens_q = (
-                torch.arange(
-                    len(cu_seq_lens),
-                    dtype=torch.int32,
-                    device=inputs.device,
-                )
-                * max_seq_len_q
+        batch_size = len(cu_seq_lens) - 1
+        max_seq_len_q = self.query.shape[0]
+        cu_seq_lens_q = (
+            torch.arange(
+                len(cu_seq_lens),
+                dtype=torch.int32,
+                device=inputs.device,
             )
-            query = repeat(
-                self.query, "n_latents dim -> (b n_latents) dim", b=batch_size
+            * max_seq_len_q
+        )
+        query = repeat(self.query, "n_latents dim -> (b n_latents) dim", b=batch_size)
+        if position_ids is not None:
+            position_emb = self.rotary_emb(
+                inputs.unsqueeze(0), position_ids.unsqueeze(0)
             )
-            if position_ids is not None:
-                position_emb = self.rotary_emb(
-                    inputs.unsqueeze(0), position_ids.unsqueeze(0)
-                )
-        else:
-            # Not doing sequence packing.
-            batch_size, _, _ = inputs.shape
-            query = self.query.expand(batch_size, -1, -1)
-            max_seq_len_q = None
-            cu_seq_lens_q = None
-            position_emb = self.rotary_emb(inputs, position_ids)
 
         latent = self.cross_attention(
             query=query,
@@ -131,7 +118,6 @@ class VariationalEncoder(nn.Module):
             max_seq_len_q=max_seq_len_q,
             cu_seq_lens_k=cu_seq_lens,
             cu_seq_lens_q=cu_seq_lens_q,
-            attn_mask=attn_mask,
         )
 
         latent = self.pooling_norm(latent).to(torch.bfloat16)
@@ -160,8 +146,8 @@ class VariationalAutoEncoder(nn.Module):
         config: DictConfig,
         model_name: str,
         d_latent: int,
-        n_latents: int = 256,
-        vocab_size: int = 151666,
+        n_latents: int = 64,
+        vocab_size: int = 151665,
         pad_token_id: int = -100,
         max_action_len: int = 1024,
         n_self_attn_heads: int = 8,
@@ -181,11 +167,11 @@ class VariationalAutoEncoder(nn.Module):
             model_name=model_name,
             n_latents=n_latents,
             latent_dim=d_latent,
-            vocab_size=vocab_size,
             pad_token_id=pad_token_id,
             max_action_len=max_action_len,
             n_self_attn_layers=n_decoder_self_attn_layers,
             n_self_attn_heads=n_self_attn_heads,
+            n_cross_attn_heads=n_cross_attn_heads,
             dropout=dropout,
         )
 
@@ -205,45 +191,27 @@ class VariationalAutoEncoder(nn.Module):
     def forward(
         self,
         input_ids: Float[torch.Tensor, "batch seq_len"],
-        max_seq_len: Optional[int] = None,
-        cu_seq_lens: Optional[Int32[torch.Tensor, "batch+1"]] = None,
-        position_ids: Optional[Int64[torch.Tensor, "batch*seq_len"]] = None,
-        latent_indices: Optional[Int64[torch.Tensor, "batch*n_latents"]] = None,
-        padding_indices: Optional[Int64[torch.Tensor, "batch*seq_len"]] = None,
-        decoder_position_ids: Optional[Int[torch.Tensor, "batch*total_seq_len"]] = None,
-        attn_mask: Optional[Bool[torch.Tensor, "batch*seq_len"]] = None,
-        targets: Optional[torch.Tensor] = None,
+        corrupted_ids: Float[torch.Tensor, "batch seq_len"],
+        max_seq_len: int,
+        cu_seq_lens: Int32[torch.Tensor, "batch+1"],
+        position_ids: Int64[torch.Tensor, "batch*seq_len"],
+        targets: Optional[Float[torch.Tensor, "batch seq_len"]] = None,
+        return_hidden_state: bool = False,
     ) -> Dict[str, Float[torch.Tensor, "batch seq_len dim"]]:
-
-        if attn_mask is not None:
-            # We're not using Flash Attention.
-            assert max_seq_len is None
-            assert cu_seq_lens is None
-            assert position_ids is None
-
-        if position_ids is not None:
-            # We're doing sequence packing + Flash Attention.
-            assert attn_mask is None
-            assert max_seq_len is not None
-            assert cu_seq_lens is not None
-            assert latent_indices is not None
-            assert padding_indices is not None
-            assert decoder_position_ids is not None
 
         variational_params = self.recognition_model(
             input_ids=input_ids,
             max_seq_len=max_seq_len,
             cu_seq_lens=cu_seq_lens,
             position_ids=position_ids,
-            attn_mask=attn_mask,
         )
 
         mu = variational_params["mean"]
         log_sigma = variational_params["log_var"]
 
         # Clamp to prevent compilation issues.
-        mu = torch.clamp(mu, min=-10, max=10)
-        log_sigma = torch.clamp(log_sigma, min=-10, max=10)
+        mu = torch.clamp(mu, min=-5, max=5)
+        log_sigma = torch.clamp(log_sigma, min=-5, max=5)
 
         # Reparameterization trick.
         epsilon = torch.randn_like(mu)
@@ -251,40 +219,21 @@ class VariationalAutoEncoder(nn.Module):
         z = mu + sigma * epsilon
         z = z.to(torch.bfloat16)
 
-        logits = self.generative_model(
+        outputs = self.generative_model(
             z,
-            position_ids=decoder_position_ids,
-            latent_indices=latent_indices,
-            padding_indices=padding_indices,
+            input_ids=corrupted_ids,
+            position_ids=position_ids,
+            max_seq_len_q=max_seq_len,
+            cu_seq_lens_q=cu_seq_lens,
+            targets=targets,
         )
 
-        if targets is not None:
-            targets_flat = targets.reshape(-1)
+        hidden_state = outputs["hidden_state"] if return_hidden_state else None
+        loss = outputs["loss"]
 
-            # Don't compute all at once
-            chunk_size = 2048
-            total_loss = 0
-            num_chunks = 0
-
-            for i in range(0, len(logits), chunk_size):
-                chunk_logits = logits[i : i + chunk_size]
-                chunk_targets = targets_flat[i : i + chunk_size]
-
-                chunk_loss = F.cross_entropy(
-                    chunk_logits,
-                    chunk_targets,
-                    ignore_index=-100,
-                    reduction="sum",
-                )
-                total_loss += chunk_loss
-                num_chunks += (chunk_targets != -100).sum()
-
-            recon_loss = total_loss / num_chunks
-
-            return {
-                "loss": recon_loss,
-                "mean": mu,
-                "log_var": log_sigma,
-            }
-        else:
-            return {"logits": logits, "mean": mu, "log_var": log_sigma}
+        return {
+            "hidden_state": hidden_state,
+            "loss": loss,
+            "mean": mu,
+            "log_var": log_sigma,
+        }
