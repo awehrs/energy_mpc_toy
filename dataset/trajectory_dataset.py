@@ -246,7 +246,10 @@ class TrajectoryDataset(Dataset):
                             if msg_trace[msg_idx]["content"] != "":
                                 actions_traj.append(msg_trace[msg_idx]["content"])
                                 msg_idx += 1
-                            elif "function_call" in msg_trace[msg_idx] and msg_trace[msg_idx]["function_call"] != "":
+                            elif (
+                                "function_call" in msg_trace[msg_idx]
+                                and msg_trace[msg_idx]["function_call"] != ""
+                            ):
                                 func_calls = []
                                 while (
                                     msg_idx < len(msg_trace)
@@ -268,7 +271,10 @@ class TrajectoryDataset(Dataset):
                             # Add precepts.
                             if msg_trace[msg_idx]["role"] == "function":
                                 func_resps = []
-                                while msg_idx < len(msg_trace) and msg_trace[msg_idx]["role"] == "function":
+                                while (
+                                    msg_idx < len(msg_trace)
+                                    and msg_trace[msg_idx]["role"] == "function"
+                                ):
                                     func_resps.append(msg_trace[msg_idx]["content"])
                                     msg_idx += 1
                                 precept_traj.append("".join(func_resps))
@@ -278,20 +284,28 @@ class TrajectoryDataset(Dataset):
 
                             # Add actions, infill precepts.
                             elif msg_trace[msg_idx]["role"] == "assistant":
-                                while msg_idx < len(msg_trace) and msg_trace[msg_idx]["role"] == "assistant":
+                                while (
+                                    msg_idx < len(msg_trace)
+                                    and msg_trace[msg_idx]["role"] == "assistant"
+                                ):
                                     if msg_trace[msg_idx]["content"] != "":
                                         actions_traj.append(
                                             msg_trace[msg_idx]["content"]
                                         )
                                         precept_traj.append(null_symbol)
                                         msg_idx += 1
-                                    elif "function_call" in msg_trace[msg_idx] and msg_trace[msg_idx]["function_call"] != "":
+                                    elif (
+                                        "function_call" in msg_trace[msg_idx]
+                                        and msg_trace[msg_idx]["function_call"] != ""
+                                    ):
                                         func_calls = []
                                         while (
                                             msg_idx < len(msg_trace)
-                                            and msg_trace[msg_idx]["role"] == "assistant"
+                                            and msg_trace[msg_idx]["role"]
+                                            == "assistant"
                                             and "function_call" in msg_trace[msg_idx]
-                                            and msg_trace[msg_idx]["function_call"] != ""
+                                            and msg_trace[msg_idx]["function_call"]
+                                            != ""
                                         ):
                                             func_calls.append(
                                                 json.dumps(
@@ -501,8 +515,7 @@ class TrajectoryDataset(Dataset):
             .agg(pl.all())
             .with_columns(
                 pl.col("num_steps").list.first(),
-                # pl.col("action_tokens_length").list.sum(),
-                # pl.col("precept_tokens_length").list.sum(),
+                c,
             )
             .sink_parquet("temp_flattened/flat_trajectory.parquet")
         )
@@ -545,7 +558,7 @@ class TrajectoryDataset(Dataset):
                 "quantiles": precept_quantiles,
             },
             "trajectory": {
-                "lengths": trajectory_quantiles,
+                "lengths": trajectory_lengths,
                 "quantiles": trajectory_quantiles,
             },
         }

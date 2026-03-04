@@ -171,7 +171,7 @@ MAX_SSH_RETRIES=100
 for attempt in $(seq 1 $MAX_SSH_RETRIES); do
     echo "   SSH attempt $attempt/$MAX_SSH_RETRIES..."
 
-    if ssh -o BatchMode=yes -o StrictHostKeyChecking=accept-new -o ConnectTimeout=15 \
+    if ssh -o BatchMode=yes -o StrictHostKeyChecking=no -o ConnectTimeout=15 \
            -i $SSH_PATH ubuntu@${INSTANCE_IP} 'echo "SSH ready"' >/dev/null 2>&1; then
         echo "✅ SSH connection successful"
         SSH_READY=true
@@ -204,7 +204,7 @@ rsync -av --progress \
     --exclude='outputs' \
     --exclude='.venv' \
     --exclude='tests' \
-    -e "ssh -o BatchMode=yes -o StrictHostKeyChecking=accept-new -i ${SSH_PATH}" \
+    -e "ssh -o BatchMode=yes -o StrictHostKeyChecking=no -i ${SSH_PATH}" \
     . ubuntu@${INSTANCE_IP}:~/${PROJECT_NAME}/
 
 rm ./servicekey.json
@@ -339,14 +339,14 @@ fi
 EOF
 
 # Copy and run the setup script
-scp -o BatchMode=yes -o StrictHostKeyChecking=accept-new -i $SSH_PATH \
+scp -o BatchMode=yes -o StrictHostKeyChecking=no -i $SSH_PATH \
     setup_and_train.sh ubuntu@${INSTANCE_IP}:~/
 
 # Clean up local setup script
 rm -f setup_and_train.sh
 
 # Pass GCS_BUCKET as third argument
-ssh -o BatchMode=yes -o StrictHostKeyChecking=accept-new -i $SSH_PATH \
+ssh -o BatchMode=yes -o StrictHostKeyChecking=no -i $SSH_PATH \
     ubuntu@${INSTANCE_IP} \
     "chmod +x setup_and_train.sh && ./setup_and_train.sh \
     ${PROJECT_NAME} \

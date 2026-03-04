@@ -1,13 +1,9 @@
 import abc
-import time
-import logging
 from typing import Optional
 
 import einops
 import torch
 import torch.nn as nn
-
-logger = logging.getLogger(__name__)
 
 try:
     from torch.nn.attention.flex_attention import flex_attention, create_block_mask
@@ -72,28 +68,17 @@ class JEPAPredictor(Predictor):
         elif isinstance(module, nn.RMSNorm):
             nn.init.ones_(module.weight)
 
-    @torch.no_grad()
-    def warmup_flex_attention(self, device, n_state_latents, n_action_latents, min_T=2, max_T=14, B=2):
-        """Pre-compile flex_attention kernels for all expected T values."""
-        N = n_state_latents + n_action_latents
-        logger.info(f"Warming up flex_attention for T in [{min_T}, {max_T}] (N={N})...")
-        for T in range(min_T, max_T + 1):
-            t0 = time.time()
-            dtype = next(self.parameters()).dtype
-            state = torch.zeros(B, T, n_state_latents, self.d_model, device=device, dtype=dtype)
-            action = torch.zeros(B, T, n_action_latents, self.d_model, device=device, dtype=dtype)
-            traj_mask = torch.ones(B, T, dtype=torch.bool, device=device)
-            self.forward(state, traj_mask, action=action)
-            torch.cuda.synchronize()
-            logger.info(f"  T={T} (S={T * N}): {time.time() - t0:.2f}s")
-        logger.info("Flex attention warmup done.")
+    @staticmethod
+    def build_block_mask(traj_mask: torch.Tensor, N: int, device: torch.device):
+        """Build flex_attention block mask (call outside torch.compile).
 
-    def _make_mask_mod(self, traj_mask, N):
-        """Return a mask_mod closure for create_block_mask.
-
-        Pattern: position at step t attends to steps {t-1, t} only,
-        and both query/key positions must be valid (non-padded) steps.
+        Args:
+            traj_mask: [B, T] — True for valid steps
+            N: latents per step (Ns + Na)
+            device: target device
         """
+        B, T = traj_mask.shape
+        S = T * N
 
         def mask_mod(b, h, q_idx, kv_idx):
             q_step = q_idx // N
@@ -103,19 +88,40 @@ class JEPAPredictor(Predictor):
             kv_valid = traj_mask[b, kv_step]
             return same_or_prev & q_valid & kv_valid
 
-        return mask_mod
+        return create_block_mask(
+            mask_mod, B=B, H=None, Q_LEN=S, KV_LEN=S, device=device,
+        )
+
+    @classmethod
+    @torch.no_grad()
+    def warmup_flex_attention(cls, device, d_model, n_heads, n_state_latents, n_action_latents, min_T=2, max_T=14):
+        """Pre-compile flex_attention and create_block_mask kernels for expected T values."""
+        N = n_state_latents + n_action_latents
+        B = 2
+        H = n_heads
+        D = d_model // n_heads
+        dtype = torch.bfloat16
+        for T in range(min_T, max_T + 1):
+            S = T * N
+            traj_mask = torch.ones(B, T, dtype=torch.bool, device=device)
+            block_mask = cls.build_block_mask(traj_mask, N, device)
+            q = torch.zeros(B, H, S, D, device=device, dtype=dtype)
+            k = torch.zeros(B, H, S, D, device=device, dtype=dtype)
+            v = torch.zeros(B, H, S, D, device=device, dtype=dtype)
+            flex_attention(q, k, v, block_mask=block_mask)
+            torch.cuda.synchronize()
 
     def forward(
         self,
         state: torch.Tensor,
-        traj_mask: torch.Tensor,
+        block_mask,
         action: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """
         Args:
-            state:     [B, T, Ns, d]  — memory output (or raw precept latents for unconditional)
-            traj_mask: [B, T]
-            action:    [B, T, Na, d]  — current action latents (optional; None for unconditional)
+            state:      [B, T, Ns, d]  — memory output (or raw precept latents for unconditional)
+            block_mask: BlockMask from build_block_mask (computed outside compile)
+            action:     [B, T, Na, d]  — current action latents (optional; None for unconditional)
         Returns:
             [B, T, Ns+Na, d] if action provided, [B, T, Ns, d] otherwise
         """
@@ -127,20 +133,6 @@ class JEPAPredictor(Predictor):
         H = self.n_heads
         D = self.head_dim
         S = T * N
-
-        # Build flex attention block mask
-        t0 = time.time()
-        mask_mod = self._make_mask_mod(traj_mask, N)
-        block_mask = create_block_mask(
-            mask_mod,
-            B=B,
-            H=None,
-            Q_LEN=S,
-            KV_LEN=S,
-            device=state.device,
-        )
-        torch.cuda.synchronize()
-        logger.info(f"    create_block_mask: {time.time() - t0:.3f}s (B={B}, T={T}, S={S})")
 
         # Flatten steps × latents: [B, T*(Ns+Na), d]
         x = einops.rearrange(x_4d, "b t n d -> b (t n) d")

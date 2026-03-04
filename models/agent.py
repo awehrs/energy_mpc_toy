@@ -7,8 +7,9 @@ from typing import Dict, Optional, Tuple
 import torch
 import torch.nn as nn
 
-logger = logging.getLogger(__name__)
 from omegaconf import DictConfig, OmegaConf
+
+logger = logging.getLogger(__name__)
 
 from models.energy import Energy
 from models.memory import Memory
@@ -317,7 +318,6 @@ class ToolAgent(Agent):
         # --- 1. Encode  ---
 
         t0 = time.time()
-        # [total_precept_tokens, d]
         precept_hidden = self.sensor(
             input_ids=precept_tokens,
             position_ids=precept_position_ids,
@@ -326,7 +326,6 @@ class ToolAgent(Agent):
         logger.info(f"    sensor(precept): {time.time() - t0:.2f}s")
 
         t0 = time.time()
-        # [total_action_tokens, d]
         action_hidden = self.sensor(
             input_ids=action_tokens,
             position_ids=action_position_ids,
@@ -337,14 +336,12 @@ class ToolAgent(Agent):
         # --- 2. Downsample  ---
 
         t0 = time.time()
-        # [S * Np, d]
         precept_latents = self.precept_downsampler(
             embedding=precept_hidden,
             max_seq_len=precept_max_seq_len,
             cu_seq_lens=precept_cu_seq_lens,
         )
 
-        # [S * Na, d]
         action_latents = self.action_downsampler(
             embedding=action_hidden,
             max_seq_len=action_max_seq_len,
@@ -378,6 +375,7 @@ class ToolAgent(Agent):
         null = self.null_action_latent.unsqueeze(0).expand(
             bsz, -1, -1, -1
         )  # [B, 1, Na, d]
+
         previous_action_latents = torch.cat(
             [null, action_latents[:, :-1]],
             dim=1,
@@ -395,10 +393,16 @@ class ToolAgent(Agent):
         # Predictor sees current state + current action (unshifted).
 
         t0 = time.time()
+        N = n_state_latents + n_action_latents
+        block_mask = self.predictor.build_block_mask(traj_mask, N, state.device)
+        torch.cuda.synchronize()
+        logger.info(f"    block_mask: {time.time() - t0:.2f}s")
+
+        t0 = time.time()
         pred_full = self.predictor(
             state=state,
+            block_mask=block_mask,
             action=action_latents,
-            traj_mask=traj_mask,
         )  # [B, T, Ns+Na, d]
         torch.cuda.synchronize()
         logger.info(f"    predictor: {time.time() - t0:.2f}s")

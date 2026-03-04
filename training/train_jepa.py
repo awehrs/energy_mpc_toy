@@ -362,24 +362,12 @@ class EMAEncoder(nn.Module):
 class JepaTrainer(AccelerateTrainer):
     """Trainer for JEPA with EMA target encoder."""
 
-    def _compile(self):
-        """Compile only the predictor — it needs torch.compile for flex_attention.
-
-        Memory (GDN) is excluded: flash-linear-attention already provides optimised
-        CUDA kernels, and GDN sees variable (B*T, N, d) shapes per micro-batch which
-        causes constant recompilation overhead.
-        """
-        self.model.predictor = torch.compile(
-            self.model.predictor,
-            mode=self.config.torch_compile_mode,
-        )
-        return self.model
-
     def __init__(
         self,
         jepa_model: nn.Module,
         config: DictConfig,
         train_dataset: torch.utils.data.Dataset,
+        max_traj_len: int,
         eval_dataset: Optional[torch.utils.data.Dataset] = None,
         collate_fn: Optional[Callable] = None,
         train_batch_sampler: Optional[Callable] = None,
@@ -411,12 +399,45 @@ class JepaTrainer(AccelerateTrainer):
         # Keep unwrapped reference (unwrap_model chokes on partial compilation)
         self._unwrapped_model = jepa_model
 
-        # Pre-compile flex_attention kernels for all trajectory lengths
-        jepa_model.predictor.warmup_flex_attention(
-            device=self.accelerator.device,
-            n_state_latents=jepa_model.precept_downsampler.query.shape[0],
-            n_action_latents=jepa_model.action_downsampler.query.shape[0],
+        # Pre-compile flex_attention + torch.compile graph for the predictor
+        # Runs through the actual compiled predictor for all expected T values
+        logger.info("Warming up predictor (flex_attention + torch.compile)...")
+        t0 = time.time()
+        n_state = jepa_model.precept_downsampler.query.shape[0]
+        n_action = jepa_model.action_downsampler.query.shape[0]
+        device = self.accelerator.device
+        predictor = self.model.predictor  # compiled version
+        self.max_traj_len = max_traj_len
+        with torch.no_grad(), self.accelerator.autocast():
+            for T in range(2, max_traj_len + 1):
+                B = 2
+                d = jepa_model.predictor.d_model
+                state = torch.zeros(
+                    B, T, n_state, d, device=device, dtype=torch.bfloat16
+                )
+                action = torch.zeros(
+                    B, T, n_action, d, device=device, dtype=torch.bfloat16
+                )
+                traj_mask = torch.ones(B, T, dtype=torch.bool, device=device)
+                block_mask = JEPAPredictor.build_block_mask(
+                    traj_mask, n_state + n_action, device
+                )
+                predictor(state=state, block_mask=block_mask, action=action)
+                torch.cuda.synchronize()
+        logger.info(f"Predictor warmup done in {time.time() - t0:.1f}s")
+
+    def _compile(self):
+        """Compile only the predictor — it needs torch.compile for flex_attention.
+
+        Memory (GDN) is excluded: flash-linear-attention already provides optimised
+        CUDA kernels, and GDN sees variable (B*T, N, d) shapes per micro-batch which
+        causes constant recompilation overhead.
+        """
+        self.model.predictor = torch.compile(
+            self.model.predictor,
+            mode=self.config.torch_compile_mode,
         )
+        return self.model
 
     def save_checkpoint(self, step: int, is_best: bool = False):
         super().save_checkpoint(step, is_best)
@@ -482,7 +503,9 @@ class JepaTrainer(AccelerateTrainer):
                 # Ablation: zero out precept tokens (restore action)
                 with self.accelerator.autocast():
                     fwd_kwargs["action_tokens"] = batch["action_ids"]
-                    fwd_kwargs["precept_tokens"] = torch.zeros_like(batch["precept_ids"])
+                    fwd_kwargs["precept_tokens"] = torch.zeros_like(
+                        batch["precept_ids"]
+                    )
                     out_no_state = self.model.jepa_forward(**fwd_kwargs)
                 total_loss_no_state += out_no_state["loss"].item()
 
@@ -514,10 +537,12 @@ class JepaTrainer(AccelerateTrainer):
 
     def _compute_loss(self, batch: Dict[str, torch.Tensor]) -> torch.Tensor:
         bsz = len(batch["cu_traj_lens"]) - 1
-        logger.info(f"[step {self.global_step}] _compute_loss: bsz={bsz}, "
-                      f"precept_tokens={batch['precept_ids'].shape}, "
-                      f"action_tokens={batch['action_ids'].shape}, "
-                      f"max_traj_len={batch['max_traj_len']}")
+        logger.info(
+            f"[step {self.global_step}] _compute_loss: bsz={bsz}, "
+            f"precept_tokens={batch['precept_ids'].shape}, "
+            f"action_tokens={batch['action_ids'].shape}, "
+            f"max_traj_len={batch['max_traj_len']}"
+        )
 
         # 1. EMA forward → targets [B, T, Np, d]
         t0 = time.time()
@@ -564,10 +589,12 @@ class JepaTrainer(AccelerateTrainer):
             # Cosine similarity between consecutive target steps
             traj_mask = batch["traj_mask"]
             consec_mask = traj_mask[:, :-1] & traj_mask[:, 1:]  # [B, T-1]
-            t_cur = targets[:, :-1].flatten(2)   # [B, T-1, Np*d]
-            t_nxt = targets[:, 1:].flatten(2)    # [B, T-1, Np*d]
+            t_cur = targets[:, :-1].flatten(2)  # [B, T-1, Np*d]
+            t_nxt = targets[:, 1:].flatten(2)  # [B, T-1, Np*d]
             cos = nn.functional.cosine_similarity(t_cur, t_nxt, dim=-1)  # [B, T-1]
-            target_consec_cos = (cos * consec_mask).sum() / consec_mask.sum().clamp(min=1)
+            target_consec_cos = (cos * consec_mask).sum() / consec_mask.sum().clamp(
+                min=1
+            )
 
         return outputs["loss"], {
             "target_std": targets.std().detach(),
@@ -702,6 +729,7 @@ def main(cfg: DictConfig) -> None:
         jepa_model=model,
         config=cfg.training,
         train_dataset=train_dataset,
+        max_traj_len=dataset.stats["trajectory"]["max"],
         eval_dataset=eval_dataset,
         collate_fn=collator,
         train_batch_sampler=train_batch_sampler,

@@ -1,5 +1,4 @@
 import abc
-from typing import Optional
 
 import einops
 import torch
@@ -93,12 +92,11 @@ class GatedDeltaMemory(Memory):
         self.n_state_latents = n_state_latents
 
         # Learned fusion queries
-        self.fusion_latents = nn.Parameter(
-            torch.randn(n_state_latents, d_model) * 0.02
-        )
+        self.fusion_latents = nn.Parameter(torch.randn(n_state_latents, d_model) * 0.02)
 
         # Fusion: cross-attend from learned latents to concat(precepts, actions)
         self.fusion_norm_kv = nn.RMSNorm(d_model, eps=norm_eps)
+
         self.fusion_attn = Attention(
             d_model=d_model,
             n_heads=n_heads,
@@ -106,6 +104,7 @@ class GatedDeltaMemory(Memory):
             is_cross_attention=True,
         )
         self.fusion_ffn_norm = nn.RMSNorm(d_model, eps=norm_eps)
+
         self.fusion_ffn = MLP(d_model)
 
         # Memory blocks
@@ -149,7 +148,7 @@ class GatedDeltaMemory(Memory):
 
         # Cross-attention (batched 3D)
         state = self.fusion_attn(query=q, key=kv)  # [B*T, n_state_latents, d]
-        state = state + q  # residual
+        state = state + q
 
         # FFN
         state = self.fusion_ffn(self.fusion_ffn_norm(state)) + state
