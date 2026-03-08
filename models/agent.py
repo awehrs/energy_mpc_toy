@@ -1,24 +1,24 @@
 import abc
-import time
+import math
 import logging
 from pathlib import Path
 from typing import Dict, Optional, Tuple
 
+import einops
 import torch
 import torch.nn as nn
-
 from omegaconf import DictConfig, OmegaConf
 
-logger = logging.getLogger(__name__)
-
-from models.energy import Energy
+from models.energy import Energy, CompletionModel
 from models.memory import Memory
-from models.policy import Policy
+from models.policy import Policy, FlowPolicy
 from models.sensors import Sensor, LanguageSensor
 from models.actuators import Actuator, LanguageActuator
 from models.predictor import Predictor, JEPAPredictor
 from models.memory import GatedDeltaMemory
 from models.attention import Downsampler
+
+logger = logging.getLogger(__name__)
 
 
 class Agent(abc.ABC, nn.Module):
@@ -30,21 +30,23 @@ class ToolAgent(Agent):
     def __init__(
         self,
         config: DictConfig,
-        energy: Optional[Energy] = None,
-        memory: Optional[Memory] = None,
-        policy: Optional[Policy] = None,
         sensor: Optional[Sensor] = None,
-        actuator: Optional[Actuator] = None,
+        memory: Optional[Memory] = None,
         predictor: Optional[Predictor] = None,
+        actuator: Optional[Actuator] = None,
+        energy: Optional[Energy] = None,
+        policy: Optional[Policy] = None,
+        completion: Optional[CompletionModel] = None,
     ):
         super().__init__()
         self.config = config
-        self.energy = energy
-        self.memory = memory
-        self.policy = policy
         self.sensor = sensor
-        self.actuator = actuator
+        self.memory = memory
         self.predictor = predictor
+        self.actuator = actuator
+        self.energy = energy
+        self.policy = policy
+        self.completion = completion
 
         self.precept_downsampler = Downsampler(
             d_model=config.model.d_model,
@@ -65,48 +67,89 @@ class ToolAgent(Agent):
             torch.randn(1, config.model.n_action_latents, config.model.d_model) * 0.02
         )
 
-    def save_components(self, save_dir: Path, config: DictConfig) -> None:
-        """Save each component's state_dict to separate files."""
+        # Constant target state for terminal (STOP) steps.
+        # Predictor trains to predict this from (last_state, last_action).
+        # Completion model trains to output 0 energy from this.
+        self.s_terminal = nn.Parameter(
+            torch.randn(config.model.n_precept_latents, config.model.d_model) * 0.02
+        )
+
+        self.continue_constant: float = config.model.energy.continue_constant
+
+    def save_components(
+        self,
+        save_dir: Path,
+        config: DictConfig,
+        components: Optional[list] = None,
+    ) -> None:
+        """Save component state dicts to separate files.
+
+        Args:
+            save_dir:   destination directory
+            config:     model config (always saved as config.yaml)
+            components: list of component names to save, or None to save all.
+                        Valid names: "sensor_projection", "precept_downsampler",
+                        "action_downsampler", "memory", "predictor", "actuator",
+                        "energy", "policy", "completion", "null_action_latent"
+        """
+
+        def _should_save(name: str) -> bool:
+            return components is None or name in components
+
         save_dir = Path(save_dir)
         save_dir.mkdir(parents=True, exist_ok=True)
         OmegaConf.save(config, save_dir / "config.yaml")
 
-        if self.sensor is not None:
+        if _should_save("sensor_projection") and self.sensor is not None:
             torch.save(
                 self.sensor.projection.state_dict(),
                 save_dir / "sensor_projection.pt",
             )
-        torch.save(
-            self.precept_downsampler.state_dict(),
-            save_dir / "precept_downsampler.pt",
-        )
-        torch.save(
-            self.action_downsampler.state_dict(),
-            save_dir / "action_downsampler.pt",
-        )
-        if self.memory is not None:
+        if _should_save("precept_downsampler"):
+            torch.save(
+                self.precept_downsampler.state_dict(),
+                save_dir / "precept_downsampler.pt",
+            )
+        if _should_save("action_downsampler"):
+            torch.save(
+                self.action_downsampler.state_dict(),
+                save_dir / "action_downsampler.pt",
+            )
+        if _should_save("memory") and self.memory is not None:
             torch.save(self.memory.state_dict(), save_dir / "memory.pt")
-        if self.predictor is not None:
+        if _should_save("predictor") and self.predictor is not None:
             torch.save(self.predictor.state_dict(), save_dir / "predictor.pt")
-        if self.actuator is not None:
+        if _should_save("actuator") and self.actuator is not None:
             torch.save(self.actuator.state_dict(), save_dir / "actuator.pt")
-        if self.energy is not None:
+        if _should_save("energy") and self.energy is not None:
             torch.save(self.energy.state_dict(), save_dir / "energy.pt")
-        if self.policy is not None:
+        if _should_save("policy") and self.policy is not None:
             torch.save(self.policy.state_dict(), save_dir / "policy.pt")
-        torch.save(
-            {"null_action_latent": self.null_action_latent.data},
-            save_dir / "null_action_latent.pt",
-        )
+        if _should_save("completion") and self.completion is not None:
+            torch.save(self.completion.state_dict(), save_dir / "completion.pt")
+        if _should_save("null_action_latent"):
+            torch.save(
+                {"null_action_latent": self.null_action_latent.data},
+                save_dir / "null_action_latent.pt",
+            )
+        if _should_save("s_terminal"):
+            torch.save(
+                {"s_terminal": self.s_terminal.data},
+                save_dir / "s_terminal.pt",
+            )
 
     @classmethod
     def from_pretrained(cls, load_dir: Path, config: DictConfig) -> "ToolAgent":
         """Construct agent and load component state dicts from a directory.
 
         Only loads components whose .pt files exist, so a partial checkpoint
-        (e.g. JEPA-only, no actuator) works fine.
+        (e.g. JEPA-only, no energy/policy yet) works fine. Post-JEPA components
+        are constructed when their config sub-keys are present and loaded when
+        their .pt files exist.
         """
         load_dir = Path(load_dir)
+
+        # --- Build JEPA components (always present) ---
 
         sensor = LanguageSensor(
             model_name=config.model.sensor.model_name,
@@ -129,31 +172,71 @@ class ToolAgent(Agent):
             norm_eps=config.model.norm_eps,
         )
 
+        # --- Build post-JEPA components when config is present ---
+
+        energy = None
+        if hasattr(config.model, "energy"):
+            energy = Energy(
+                d_model=config.model.d_model,
+                n_heads=config.model.n_heads,
+            )
+
+        completion = None
+        if hasattr(config.model, "completion"):
+            completion = CompletionModel(
+                d_model=config.model.d_model,
+                n_heads=config.model.n_heads,
+            )
+
+        policy = None
+        if hasattr(config.model, "policy"):
+            policy = FlowPolicy(
+                d_model=config.model.d_model,
+                n_heads=config.model.n_heads,
+                n_layers=config.model.policy.n_layers,
+                n_action_latents=config.model.n_action_latents,
+                time_emb_dim=config.model.policy.time_emb_dim,
+                n_integration_steps=config.model.policy.n_integration_steps,
+                norm_eps=config.model.norm_eps,
+            )
+
         agent = cls(
             config=config,
             sensor=sensor,
             memory=memory,
             predictor=predictor,
+            energy=energy,
+            policy=policy,
+            completion=completion,
         )
 
-        # Load available component state dicts
+        # --- Load whatever .pt files exist ---
+
         component_map = {
             "sensor_projection.pt": agent.sensor.projection,
             "precept_downsampler.pt": agent.precept_downsampler,
             "action_downsampler.pt": agent.action_downsampler,
             "memory.pt": agent.memory,
             "predictor.pt": agent.predictor,
+            "energy.pt": agent.energy,
+            "policy.pt": agent.policy,
+            "completion.pt": agent.completion,
         }
 
         for filename, module in component_map.items():
             path = load_dir / filename
-            if path.exists():
+            if path.exists() and module is not None:
                 module.load_state_dict(torch.load(path, weights_only=True))
 
         null_path = load_dir / "null_action_latent.pt"
         if null_path.exists():
             data = torch.load(null_path, weights_only=True)
             agent.null_action_latent.data.copy_(data["null_action_latent"])
+
+        s_terminal_path = load_dir / "s_terminal.pt"
+        if s_terminal_path.exists():
+            data = torch.load(s_terminal_path, weights_only=True)
+            agent.s_terminal.data.copy_(data["s_terminal"])
 
         if (load_dir / "actuator.pt").exists():
             actuator = LanguageActuator(
@@ -317,25 +400,18 @@ class ToolAgent(Agent):
 
         # --- 1. Encode  ---
 
-        t0 = time.time()
         precept_hidden = self.sensor(
             input_ids=precept_tokens,
             position_ids=precept_position_ids,
         )
-        torch.cuda.synchronize()
-        logger.info(f"    sensor(precept): {time.time() - t0:.2f}s")
 
-        t0 = time.time()
         action_hidden = self.sensor(
             input_ids=action_tokens,
             position_ids=action_position_ids,
         )
-        torch.cuda.synchronize()
-        logger.info(f"    sensor(action): {time.time() - t0:.2f}s")
 
         # --- 2. Downsample  ---
 
-        t0 = time.time()
         precept_latents = self.precept_downsampler(
             embedding=precept_hidden,
             max_seq_len=precept_max_seq_len,
@@ -347,9 +423,6 @@ class ToolAgent(Agent):
             max_seq_len=action_max_seq_len,
             cu_seq_lens=action_cu_seq_lens,
         )
-        torch.cuda.synchronize()
-        logger.info(f"    downsamplers: {time.time() - t0:.2f}s")
-
         # --- 3. Change to batched format  ---
 
         precept_latents = self._unpack_and_pad(  # [B, T, Np, d]
@@ -381,37 +454,28 @@ class ToolAgent(Agent):
             dim=1,
         )  # [B, T, Na, d]
 
-        t0 = time.time()
         state = self.memory(
             precepts=precept_latents,
             previous_action=previous_action_latents,
         )
-        torch.cuda.synchronize()
-        logger.info(f"    memory: {time.time() - t0:.2f}s")
 
         # --- 5. Predictor: predict next-step precept latents ---
         # Predictor sees current state + current action (unshifted).
 
-        t0 = time.time()
         N = n_state_latents + n_action_latents
         block_mask = self.predictor.build_block_mask(traj_mask, N, state.device)
-        torch.cuda.synchronize()
-        logger.info(f"    block_mask: {time.time() - t0:.2f}s")
 
-        t0 = time.time()
         pred_full = self.predictor(
             state=state,
             block_mask=block_mask,
             action=action_latents,
         )  # [B, T, Ns+Na, d]
-        torch.cuda.synchronize()
-        logger.info(f"    predictor: {time.time() - t0:.2f}s")
 
         # Slice out state portion as the prediction (drop action positions)
         prediction = pred_full[:, :, :n_state_latents, :]  # [B, T, Ns, d]
 
         # --- 6. Loss ---
-        result = {"prediction": prediction}
+        result = {"prediction": prediction, "state": state}
 
         if targets is not None:
             # prediction[t] predicts targets[t+1]
@@ -439,6 +503,118 @@ class ToolAgent(Agent):
             result["vic_cov"] = vic_cov.detach()
 
         return result
+
+    def train_completion_model(
+        self,
+        terminal_states: torch.Tensor,
+        nonterminal_states: torch.Tensor,
+    ) -> torch.Tensor:
+        """BCE loss: terminal → 1, non-terminal → 0.
+
+        Args:
+            terminal_states:    [B, Ns, d]
+            nonterminal_states: [M, Ns, d]
+        Returns:
+            scalar loss
+        """
+        return self.completion.loss(terminal_states, nonterminal_states)
+
+    @torch.no_grad()
+    def get_energy_targets(
+        self,
+        states: torch.Tensor,
+        next_states: torch.Tensor,
+        has_next: torch.Tensor,
+        dataset_weight: float = 1.0,
+        policy_weight: float = 0.0,
+        n_policy_samples: int = 0,
+    ) -> torch.Tensor:
+        """Soft Bellman path integral targets via weighted log-sum-exp.
+
+        Dataset and policy backup branches are combined with explicit weights,
+        allowing a smooth curriculum from pure-dataset to policy-augmented targets:
+
+            stop_cost    = -log P(terminal | s)
+            lse_dataset  = logsumexp(-(continue_constant + stop_grad(energy(s'_dataset))))  # K=1
+            lse_policy   = logsumexp(-(continue_constant + stop_grad(energy(s'_k)))) - log(K)
+            target       = -logsumexp([
+                               -stop_cost,
+                               log(dataset_weight) + lse_dataset,
+                               log(policy_weight)  + lse_policy,   # omitted if policy_weight=0
+                           ])
+
+        dataset_weight + policy_weight should sum to 1 for a proper mixture.
+        Terminal steps (has_next=False) are hard-coded to target=0.
+
+        Args:
+            states:          [B, Ns, d]
+            next_states:     [B, Ns, d]  — dataset successor (zeros where ~has_next)
+            has_next:        [B]  bool
+            dataset_weight:  mixture weight for dataset next-state branch
+            policy_weight:   mixture weight for policy rollout branches
+            n_policy_samples: K — number of policy branches (ignored if policy_weight=0)
+        Returns:
+            targets: [B]
+        """
+        p_terminal = self.completion.predict(states)  # [B]
+        stop_cost = -torch.log(p_terminal.clamp(min=1e-6))  # [B]
+
+        components = [-stop_cost]
+
+        if dataset_weight > 0.0:
+            lse_dataset = -(
+                self.continue_constant + self.energy(next_states).detach()
+            )  # [B]
+            components.append(math.log(dataset_weight) + lse_dataset)
+
+        if policy_weight > 0.0 and n_policy_samples > 0 and self.policy is not None:
+            actions = self.policy.sample(
+                states, num_samples=n_policy_samples
+            )  # [B, K, Na, d]
+            states_bk = einops.repeat(states, "b n d -> (b k) n d", k=n_policy_samples)
+            actions_bk = einops.rearrange(actions, "b k n d -> (b k) n d")
+            next_bk = self.predictor.predict_step(states_bk, actions_bk)  # [B*K, Ns, d]
+            energy_bk = self.energy(next_bk).detach()  # [B*K]
+            energy_bk = einops.rearrange(energy_bk, "(b k) -> b k", k=n_policy_samples)
+            costs_bk = self.continue_constant + energy_bk  # [B, K]
+            lse_policy = torch.logsumexp(-costs_bk, dim=-1) - math.log(n_policy_samples)
+            components.append(math.log(policy_weight) + lse_policy)
+
+        targets = -torch.logsumexp(torch.stack(components, dim=-1), dim=-1)
+        targets = targets.masked_fill(~has_next, 0.0)
+
+        return targets
+
+    def train_energy_model(
+        self,
+        states: torch.Tensor,
+        next_states: torch.Tensor,
+        has_next: torch.Tensor,
+        dataset_weight: float = 1.0,
+        policy_weight: float = 0.0,
+        n_policy_samples: int = 0,
+    ) -> torch.Tensor:
+        """MSE loss between predicted energy and soft Bellman targets.
+
+        Args:
+            states:           [B, Ns, d]
+            next_states:      [B, Ns, d]
+            has_next:         [B] bool
+            dataset_weight:   mixture weight for dataset branch
+            policy_weight:    mixture weight for policy branches
+            n_policy_samples: K policy rollout branches
+        Returns:
+            scalar loss
+        """
+        targets = self.get_energy_targets(
+            states,
+            next_states,
+            has_next,
+            dataset_weight,
+            policy_weight,
+            n_policy_samples,
+        )
+        return nn.functional.mse_loss(self.energy(states), targets)
 
     def generate_policy_examples(
         self,
@@ -492,53 +668,72 @@ class ToolAgent(Agent):
 
             # Return (state, action_latent) pairs
 
+    def policy_rollout_loss(
+        self,
+        state: torch.Tensor,
+        horizon: int,
+        num_samples: int,
+    ) -> torch.Tensor:
+        """Differentiable policy rollout: mean terminal energy.
+
+        Step 0 fans out to K parallel rollouts; subsequent steps sample K=1
+        per rollout. Gradients flow through integration and predictor back to
+        policy params. Energy is NOT stop-gradiented here.
+
+        Args:
+            state:       [B, Ns, d]  — starting states (from cached JEPA forward)
+            horizon:     rollout length
+            num_samples: K — candidates per starting state
+        Returns:
+            scalar — mean energy of terminal states
+        """
+        # Step 0: fan out K samples
+        action_0 = self.policy.sample(state, num_samples=num_samples)  # [B, K, Na, d]
+        state_bk = einops.repeat(state, "b n d -> (b k) n d", k=num_samples)
+        action_bk = einops.rearrange(action_0, "b k n d -> (b k) n d")
+        state_bk = self.predictor.predict_step(state_bk, action_bk)
+
+        # Steps 1..H-1: K=1 per rollout
+        for _ in range(horizon - 1):
+            action_bk = self.policy.sample(state_bk, num_samples=1).squeeze(1)
+            state_bk = self.predictor.predict_step(state_bk, action_bk)
+
+        return self.energy(state_bk).mean()
+
     def plan(
         self,
         state: torch.Tensor,
-        horizion: int,
+        horizon: int,
         num_samples: int,
-    ) -> Tuple[torch.Tensor]:
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Inference-time planning: return best first action by terminal energy.
 
-        for i in range(horizion):
-            # Sample actions.
-            actions = self.policy(
-                state,
-                num_samples=num_samples if i == 0 else 1,
-            )
+        Args:
+            state:       [B, Ns, d]  — current state from memory
+            horizon:     rollout length
+            num_samples: K — candidate action sequences per state
+        Returns:
+            best_action: [B, Na, d]  — first action of the lowest-energy rollout
+            best_energy: [B]         — terminal energy of that rollout
+        """
+        B = state.shape[0]
 
-            state = self.predictor.predict_multiple(state=state, actions=actions)
+        # Step 0: fan out K samples
+        action_0 = self.policy.sample(state, num_samples=num_samples)  # [B, K, Na, d]
+        state_bk = einops.repeat(state, "b n d -> (b k) n d", k=num_samples)
+        action_bk = einops.rearrange(action_0, "b k n d -> (b k) n d")
+        state_bk = self.predictor.predict_step(state_bk, action_bk)
 
-        energy = self.energy(state)
+        # Steps 1..H-1: K=1 per rollout
+        for _ in range(horizon - 1):
+            action_bk = self.policy.sample(state_bk, num_samples=1).squeeze(1)
+            state_bk = self.predictor.predict_step(state_bk, action_bk)
 
-    def forward(
-        self,
-        precept: torch.Tensor,
-        previous_action: Optional[torch.Tensor] = None,
-    ):
+        # Score terminal states, pick best per B
+        energies = self.energy(state_bk).view(B, num_samples)  # [B, K]
+        best_k = energies.argmin(dim=1)  # [B]
 
-        precept_latents = self.precept_downsampler(self.sensor(precept))
+        best_action = action_0[torch.arange(B), best_k]  # [B, Na, d]
+        best_energy = energies[torch.arange(B), best_k]  # [B]
 
-        state = self.memory.update(precept_latents, previous_action)
-
-        actions = []
-
-        energies = []
-
-        for i in range(None):
-
-            noise = None
-
-            # repeat precepts to match noise
-            action_latents = self.policy_model(state, noise)
-
-            # Make predictions
-            state_preds = self.predictor(state, action_latents)
-
-            # Energies
-            energies = self.energy_model(state_preds)
-
-            # Winnow actions and precepts
-            actions.append()
-
-        # Get best trajectories
-        return actions[:], energies[:]
+        return best_action, best_energy

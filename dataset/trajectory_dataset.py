@@ -7,7 +7,6 @@ from pathlib import Path
 from typing import Callable, Dict, Union, List
 
 import hydra
-import torch
 import datasets
 import numpy as np
 import polars as pl
@@ -72,7 +71,8 @@ class TrajectoryDataset(Dataset):
 
         datasets = cls.conform_example_format(
             datasets,
-            null_symbol="~",
+            null_symbol=config.null_symbol,
+            stop_symbol=config.stop_symbol,
         )
 
         dataset = concatenate_datasets(datasets)
@@ -190,6 +190,7 @@ class TrajectoryDataset(Dataset):
     def conform_example_format(
         datasets: List[datasets.Dataset],
         null_symbol: str,
+        stop_symbol: str,
     ) -> List[datasets.Dataset]:
 
         def conform_toucan(examples):
@@ -332,9 +333,11 @@ class TrajectoryDataset(Dataset):
                                     f"Unexpected role '{msg_trace[msg_idx]['role']}' at msg_idx={msg_idx}"
                                 )
 
-                # Append terminal step: null precept, "done" action
+                # Append terminal STOP step: null precept + stop_symbol action.
+                # stop_symbol is a rarely-used Unicode character (config.stop_symbol)
+                # so the actuator can detect task completion at inference.
                 precept_traj.append(null_symbol)
-                actions_traj.append("done")
+                actions_traj.append(stop_symbol)
 
                 actions.append(actions_traj)
                 precepts.append(precept_traj)
@@ -515,7 +518,6 @@ class TrajectoryDataset(Dataset):
             .agg(pl.all())
             .with_columns(
                 pl.col("num_steps").list.first(),
-                c,
             )
             .sink_parquet("temp_flattened/flat_trajectory.parquet")
         )

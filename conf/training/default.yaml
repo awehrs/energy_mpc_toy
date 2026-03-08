@@ -82,6 +82,19 @@ ema_decay: 0.999
 jepa_checkpoint: null  # Path to JEPA checkpoint dir
 
 # ================================
+# Alternating Trainer Parameters
+# ================================
+n_cycles: 5              # (energy + policy) cycles after completion phase
+completion_epochs: 1     # BCE passes over terminal states before alternating loop
+completion_batch_size: 256
+energy_batch_size: 512
+policy_batch_size: 64
+policy_steps_per_epoch: -1  # -1 = len(state_cache) // policy_batch_size
+n_terminal_steps: 2      # final N steps of each trajectory counted as terminal
+n_policy_samples: 4      # K policy rollout branches per energy target (0 = dataset only)
+max_policy_weight: 0.5   # policy mixture weight at end of training (linearly ramped)
+
+# ================================
 # Energy MPC Specific Parameters
 # ================================
 

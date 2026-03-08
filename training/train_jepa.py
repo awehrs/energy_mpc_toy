@@ -4,7 +4,7 @@ import time
 import logging
 import warnings
 from pathlib import Path
-from typing import Callable, Dict, List, Optional
+from typing import Callable, Dict, Optional
 
 import einops
 import hydra
@@ -18,269 +18,12 @@ from models.memory import GatedDeltaMemory
 from models.predictor import JEPAPredictor
 from training.trainer import AccelerateTrainer
 from dataset.trajectory_dataset import TrajectoryDataset
+from dataset.collation import BucketBatchSampler, TrajectoryCollator
 
 
 logger = logging.getLogger(__name__)
 
 warnings.filterwarnings("ignore", message="Removed shared tensor.*while saving")
-
-
-class TrajectoryCollator:
-    """Collates variable-length trajectories for JEPA training.
-
-    Produces:
-    1. Packed token sequences (flash-attention cu_seq_lens format) for sensor encoding.
-       All steps from all trajectories are concatenated flat so the sensor can encode
-       them in a single packed forward pass.
-    2. Trajectory boundary metadata for post-encoding right-padding before memory
-       processing. After the sensor produces per-step latents, the model uses
-       cu_traj_lens to split by trajectory, pads to max_traj_len, and feeds to the
-       sequence model.
-
-    Each sample is expected to yield:
-        {"action_tokens": [[...], [...], ...], "precept_tokens": [[...], [...], ...]}
-    where len(action_tokens) == len(precept_tokens) == trajectory_length.
-    """
-
-    def __init__(self, pad_token_id: int):
-        self.pad_token_id = pad_token_id
-
-    def __call__(self, features: List[Dict]) -> Dict[str, torch.Tensor]:
-        traj_lens = []
-        all_precept_seqs = []
-        all_action_seqs = []
-
-        for sample in features:
-            action_steps = sample["action_tokens"]
-            precept_steps = sample["precept_tokens"]
-            assert len(action_steps) == len(precept_steps)
-
-            traj_len = len(action_steps)
-            traj_lens.append(traj_len)
-
-            all_precept_seqs.extend(precept_steps)
-            all_action_seqs.extend(action_steps)
-
-        batch_size = len(features)
-        max_traj_len = max(traj_lens)
-
-        # Pack all step-level token sequences into flash-attention format.
-        precept_ids, precept_cu_seq_lens, precept_position_ids, precept_max_seq_len = (
-            self._pack_sequences(all_precept_seqs)
-        )
-        action_ids, action_cu_seq_lens, action_position_ids, action_max_seq_len = (
-            self._pack_sequences(all_action_seqs)
-        )
-
-        # Trajectory boundary metadata (indexes into step-space, not token-space).
-        traj_lens_t = torch.tensor(traj_lens, dtype=torch.long)
-        cu_traj_lens = torch.zeros(batch_size + 1, dtype=torch.int32)
-        cu_traj_lens[1:] = torch.cumsum(traj_lens_t.to(torch.int32), dim=0)
-
-        # [B, max_traj_len] — True for real steps, False for padding positions.
-        traj_mask = torch.arange(max_traj_len).unsqueeze(0) < traj_lens_t.unsqueeze(1)
-
-        return {
-            # Packed precept inputs for sensor
-            "precept_ids": precept_ids,
-            "precept_position_ids": precept_position_ids,
-            "precept_cu_seq_lens": precept_cu_seq_lens,
-            "precept_max_seq_len": precept_max_seq_len,
-            # Packed action inputs for sensor
-            "action_ids": action_ids,
-            "action_position_ids": action_position_ids,
-            "action_cu_seq_lens": action_cu_seq_lens,
-            "action_max_seq_len": action_max_seq_len,
-            # Trajectory metadata for post-encoding padding
-            "traj_lens": traj_lens_t,
-            "max_traj_len": max_traj_len,
-            "cu_traj_lens": cu_traj_lens,
-            "traj_mask": traj_mask,
-        }
-
-    @staticmethod
-    def _pack_sequences(sequences: List[List[int]]):
-        """Flatten variable-length token sequences into flash-attention packed format.
-
-        Returns:
-            ids:           [total_tokens]    int64   — concatenated token IDs
-            cu_seq_lens:   [num_seqs + 1]    int32   — cumulative sequence boundaries
-            position_ids:  [total_tokens]    int64   — per-sequence position indices
-            max_seq_len:   int                       — longest sequence in the batch
-        """
-        all_ids = []
-        all_position_ids = []
-        offsets = [0]
-        max_seq_len = 0
-
-        for seq in sequences:
-            n = len(seq)
-            max_seq_len = max(max_seq_len, n)
-            all_ids.extend(seq)
-            all_position_ids.extend(range(n))
-            offsets.append(offsets[-1] + n)
-
-        return (
-            torch.tensor(all_ids, dtype=torch.long),
-            torch.tensor(offsets, dtype=torch.int32),
-            torch.tensor(all_position_ids, dtype=torch.long),
-            max_seq_len,
-        )
-
-
-class BucketBatchSampler:
-    """Groups trajectories by step-count into buckets, then greedily packs
-    batches within each bucket by total token count (action + precept).
-
-    This ensures consistent GPU memory / compute across batches while
-    minimising trajectory-level padding waste before the sequence model.
-
-    Compatible with torch.utils.data.Subset (from random_split) and
-    multi-GPU training via WORLD_SIZE / RANK env vars.
-    """
-
-    def __init__(
-        self,
-        dataset: torch.utils.data.Dataset,
-        max_tokens: int,
-        bucket_width: int = 1,
-        shuffle: bool = True,
-        seed: int = 0,
-        drop_last: bool = True,
-    ):
-        self.max_tokens = max_tokens
-        self.bucket_width = bucket_width
-        self.shuffle = shuffle
-        self.seed = seed
-        self.drop_last = drop_last
-        self.num_replicas = int(os.environ.get("WORLD_SIZE", 1))
-        self.rank = int(os.environ.get("RANK", 0))
-        self.epoch = 0
-
-        # Extract trajectory lengths and per-trajectory token counts.
-        if isinstance(dataset, torch.utils.data.Subset):
-            actual_data = dataset.dataset.data
-            subset_indices = list(dataset.indices)
-            all_traj_lengths = self._get_traj_lengths(actual_data)
-            all_token_counts = self._get_token_counts(actual_data)
-            self.traj_lengths = [all_traj_lengths[i] for i in subset_indices]
-            self.token_counts = [all_token_counts[i] for i in subset_indices]
-        else:
-            self.traj_lengths = self._get_traj_lengths(dataset.data)
-            self.token_counts = self._get_token_counts(dataset.data)
-
-        # Build buckets: bucket_id -> list of dataset indices.
-        self.buckets: Dict[int, List[int]] = {}
-        for idx, length in enumerate(self.traj_lengths):
-            bucket_id = length // self.bucket_width
-            if bucket_id not in self.buckets:
-                self.buckets[bucket_id] = []
-            self.buckets[bucket_id].append(idx)
-
-    @staticmethod
-    def _get_traj_lengths(data) -> List[int]:
-        """Extract per-trajectory step counts from dataset backing store."""
-        if hasattr(data, "column_names"):
-            if "num_steps" in data.column_names:
-                return list(data["num_steps"])
-            return [len(seq) for seq in data["action_tokens"]]
-        if isinstance(data, dict):
-            if "num_steps" in data:
-                return list(data["num_steps"])
-            return [len(seq) for seq in data["action_tokens"]]
-        raise ValueError("Cannot determine trajectory lengths from dataset")
-
-    @staticmethod
-    def _get_token_counts(data) -> List[int]:
-        """Compute total token count per trajectory (action + precept).
-
-        Prefers *_length columns (pre-padding real lengths) when available,
-        falls back to computing from the token lists directly.
-        """
-        if hasattr(data, "column_names"):
-            cols = data.column_names
-        elif isinstance(data, dict):
-            cols = list(data.keys())
-        else:
-            raise ValueError("Cannot determine token counts from dataset")
-
-        if "action_tokens_length" in cols and "precept_tokens_length" in cols:
-            return [
-                sum(a) + sum(p)
-                for a, p in zip(
-                    data["action_tokens_length"],
-                    data["precept_tokens_length"],
-                )
-            ]
-        if "action_tokens" in cols and "precept_tokens" in cols:
-            return [
-                sum(len(s) for s in a) + sum(len(s) for s in p)
-                for a, p in zip(data["action_tokens"], data["precept_tokens"])
-            ]
-        raise ValueError("Cannot determine token counts from dataset")
-
-    def set_epoch(self, epoch: int):
-        self.epoch = epoch
-
-    def __len__(self):
-        total_batches = 0
-        for indices in self.buckets.values():
-            current_tokens = 0
-            for idx in indices:
-                tc = self.token_counts[idx]
-                if current_tokens + tc > self.max_tokens and current_tokens > 0:
-                    total_batches += 1
-                    current_tokens = 0
-                current_tokens += tc
-            if current_tokens > 0:
-                total_batches += 1
-        return total_batches // self.num_replicas
-
-    def __iter__(self):
-        g = torch.Generator()
-        g.manual_seed(self.seed + self.epoch)
-
-        all_batches = []
-
-        for bucket_id in sorted(self.buckets.keys()):
-            indices = self.buckets[bucket_id].copy()
-
-            if self.shuffle:
-                perm = torch.randperm(len(indices), generator=g).tolist()
-                indices = [indices[i] for i in perm]
-
-            current_batch = []
-            current_tokens = 0
-
-            for idx in indices:
-                tc = self.token_counts[idx]
-                if current_tokens + tc > self.max_tokens and current_batch:
-                    all_batches.append(current_batch)
-                    current_batch = []
-                    current_tokens = 0
-
-                current_batch.append(idx)
-                current_tokens += tc
-
-            if current_batch and not self.drop_last:
-                all_batches.append(current_batch)
-
-        # Shuffle the ordering of batches across buckets.
-        if self.shuffle:
-            perm = torch.randperm(len(all_batches), generator=g).tolist()
-            all_batches = [all_batches[i] for i in perm]
-
-        # Distribute across ranks.
-        batches_per_replica = len(all_batches) // self.num_replicas
-        start = self.rank * batches_per_replica
-        end = (
-            start + batches_per_replica
-            if self.rank < self.num_replicas - 1
-            else len(all_batches)
-        )
-
-        for batch in all_batches[start:end]:
-            yield batch
 
 
 class EMAEncoder(nn.Module):
@@ -510,7 +253,7 @@ class JepaTrainer(AccelerateTrainer):
                 total_loss_no_state += out_no_state["loss"].item()
 
                 for k, v in outputs.items():
-                    if k == "loss" or k == "prediction":
+                    if k in ("loss", "prediction", "state"):
                         continue
                     val = v.item() if hasattr(v, "item") else v
                     metric_sums[k] = metric_sums.get(k, 0.0) + val
@@ -557,6 +300,14 @@ class JepaTrainer(AccelerateTrainer):
         )
         torch.cuda.synchronize()
         logger.info(f"  EMA forward: {time.time() - t0:.2f}s")
+
+        # Overwrite EMA target at the terminal (STOP) step with s_terminal.
+        # Each trajectory's last valid step should predict the constant terminal state.
+        s_terminal = self._unwrapped_model.s_terminal  # [Np, d]
+        cu_traj_lens = batch["cu_traj_lens"]
+        for i in range(bsz):
+            last_step = (cu_traj_lens[i + 1] - cu_traj_lens[i] - 1).item()
+            targets[i, last_step] = s_terminal.detach()
 
         # 2. Student forward (loss computed inside jepa_forward)
         t0 = time.time()

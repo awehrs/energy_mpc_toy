@@ -111,6 +111,33 @@ class JEPAPredictor(Predictor):
             flex_attention(q, k, v, block_mask=block_mask)
             torch.cuda.synchronize()
 
+    def predict_step(
+        self,
+        state: torch.Tensor,
+        action: torch.Tensor,
+    ) -> torch.Tensor:
+        """Single-step prediction for differentiable rollouts.
+
+        Wraps forward() with T=1. flex_attention compiles once per (B, N) shape.
+
+        Args:
+            state:  [B, Ns, d]
+            action: [B, Na, d]
+        Returns:
+            [B, Ns, d]
+        """
+        B, Ns, _ = state.shape
+        N = Ns + action.shape[1]
+
+        state_1  = state.unsqueeze(1)   # [B, 1, Ns, d]
+        action_1 = action.unsqueeze(1)  # [B, 1, Na, d]
+
+        traj_mask  = torch.ones(B, 1, dtype=torch.bool, device=state.device)
+        block_mask = self.build_block_mask(traj_mask, N, state.device)
+
+        out = self.forward(state=state_1, block_mask=block_mask, action=action_1)
+        return out[:, 0, :Ns, :]  # [B, Ns, d]
+
     def forward(
         self,
         state: torch.Tensor,

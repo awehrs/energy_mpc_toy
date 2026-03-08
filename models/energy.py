@@ -4,84 +4,118 @@ import torch.nn as nn
 from models.attention import Attention
 
 
-class Energy(nn.Module):
-    """
-    Transformer-based Energy Model that evaluates latent representation quality.
-    Assigns low energy to latents that contain sufficient task-relevant information.
+class CompletionModel(nn.Module):
+    """Binary classifier: P(terminal | state) ∈ (0, 1).
+
+    Pools state latents via cross-attention → scalar logit.
+    Trained with BCE: s_terminal → 1, all other states → 0.
+    Used by get_energy_targets as the stop cost: -log P(terminal | state).
     """
 
     def __init__(
         self,
-        input_dim: int,
-        d_model: int = 1024,
-        n_heads: int = 8,
-        dropout: float = 0.1,
+        d_model: int,
+        n_heads: int,
+        norm_eps: float = 1e-5,
     ):
         super().__init__()
-        self.d_model = d_model
 
-        self.energy_query = nn.Parameter(torch.randn(1, d_model) * 0.02)
-
-        self.cross_attention = Attention(
+        self.query = nn.Parameter(torch.randn(1, 1, d_model) * 0.02)
+        self.norm_kv = nn.RMSNorm(d_model, eps=norm_eps)
+        self.cross_attn = Attention(
             d_model=d_model,
             n_heads=n_heads,
-            query_dim=d_model,
-            key_dim=input_dim,
-            value_dim=input_dim,
+            is_causal=False,
+            is_cross_attention=True,
         )
+        self.norm_out = nn.RMSNorm(d_model, eps=norm_eps)
+        self.out_proj = nn.Linear(d_model, 1, bias=False)
+        nn.init.zeros_(self.out_proj.weight)  # start neutral
 
-        self.pooling_norm = nn.LayerNorm(d_model)
-
-        # Energy prediction head - outputs a single scalar
-        self.energy_head = nn.Sequential(
-            nn.Linear(d_model, d_model // 2),
-            nn.GELU(),
-            nn.Dropout(dropout),
-            nn.Linear(d_model // 2, d_model // 4),
-            nn.GELU(),
-            nn.Dropout(dropout),
-            nn.Linear(d_model // 4, 1),
-        )
-
-        # Initialize weights
-        self.apply(self._init_weights)
-
-    def _init_weights(self, module):
-        if isinstance(module, nn.Linear):
-            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
-            if module.bias is not None:
-                torch.nn.init.zeros_(module.bias)
-        elif isinstance(module, nn.LayerNorm):
-            torch.nn.init.ones_(module.weight)
-            torch.nn.init.zeros_(module.bias)
-
-    def forward(self, latent: torch.Tensor) -> torch.Tensor:
+    def forward(self, state: torch.Tensor) -> torch.Tensor:
         """
         Args:
-            latent: [batch, n_latents, input_dim] - latent representation to evaluate
-
+            state: [B, Ns, d]
         Returns:
-            energy: [batch] - scalar energy for each example
+            logits: [B]  (apply sigmoid for probabilities)
         """
-        batch_size, _, _ = latent.shape
+        B = state.shape[0]
+        q = self.query.expand(B, -1, -1)
+        pooled = self.cross_attn(query=q, key=self.norm_kv(state)).squeeze(1)
+        return self.out_proj(self.norm_out(pooled)).squeeze(-1)
 
-        # Single learned query attends to all processed latent tokens
-        energy_query = self.energy_query.expand(
-            batch_size, -1, -1
-        )  # [batch, 1, d_model]
+    def predict(self, state: torch.Tensor) -> torch.Tensor:
+        """P(terminal | state) ∈ (0, 1). Shape: [B]"""
+        return torch.sigmoid(self.forward(state))
 
-        # Cross-attention: query attends to processed latents
-        pooled = self.cross_attention(
-            query=energy_query,
-            key=latent,
-            value=latent,
+    def loss(
+        self,
+        terminal_states: torch.Tensor,
+        nonterminal_states: torch.Tensor,
+    ) -> torch.Tensor:
+        """BCE loss on balanced terminal / non-terminal batch.
+
+        Args:
+            terminal_states:    [B, Ns, d] — last valid step of each trajectory
+            nonterminal_states: [M, Ns, d] — randomly sampled non-terminal steps
+        Returns:
+            scalar BCE loss
+        """
+        states = torch.cat([terminal_states, nonterminal_states], dim=0)
+        labels = torch.cat(
+            [
+                torch.ones(len(terminal_states), device=states.device),
+                torch.zeros(len(nonterminal_states), device=states.device),
+            ]
+        )
+        return nn.functional.binary_cross_entropy_with_logits(
+            self.forward(states), labels
         )
 
-        # Layer norm and squeeze
-        pooled = self.pooling_norm(pooled)
-        pooled = pooled.squeeze(1)  # [batch, d_model]
 
-        # Predict energy (single scalar per batch element)
-        energy = self.energy_head(pooled).squeeze(-1)  # [batch]
+class Energy(nn.Module):
+    """Energy model: pools state latents via cross-attention → scalar energy.
 
-        return energy
+    Low energy = state is close to task completion.
+    Terminal state (s_terminal) is trained to have energy ≈ 0.
+    """
+
+    def __init__(
+        self,
+        d_model: int,
+        n_heads: int,
+        norm_eps: float = 1e-5,
+    ):
+        super().__init__()
+
+        # Single learned query pools over Ns state latent tokens
+        self.energy_query = nn.Parameter(torch.randn(1, 1, d_model) * 0.02)
+
+        self.norm_kv = nn.RMSNorm(d_model, eps=norm_eps)
+
+        self.cross_attn = Attention(
+            d_model=d_model,
+            n_heads=n_heads,
+            is_causal=False,
+            is_cross_attention=True,
+        )
+
+        self.norm_out = nn.RMSNorm(d_model, eps=norm_eps)
+        self.out_proj = nn.Linear(d_model, 1, bias=False)
+
+        nn.init.normal_(self.out_proj.weight, std=0.02)
+
+    def forward(self, state: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            state: [B, Ns, d]
+        Returns:
+            energy: [B]
+        """
+        B = state.shape[0]
+
+        q = self.energy_query.expand(B, -1, -1)  # [B, 1, d]
+        pooled = self.cross_attn(query=q, key=self.norm_kv(state))  # [B, 1, d]
+        pooled = pooled.squeeze(1)  # [B, d]
+
+        return self.out_proj(self.norm_out(pooled)).squeeze(-1)  # [B]

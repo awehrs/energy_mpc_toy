@@ -14,14 +14,10 @@ from models.attention import Attention, TransformerBlock, MLP
 
 class Memory(abc.ABC, nn.Module):
 
-    def update(self, state: torch.Tensor, action: torch.Tensor):
-        pass
-
-    def read(self, state: torch.Tensor, action: torch.Tensor):
-        pass
+    pass
 
 
-class GatedDeltaMemoryBlock(nn.Module):
+class GatedDeltaMemoryBlock(Memory):
 
     def __init__(
         self,
@@ -60,7 +56,6 @@ class GatedDeltaMemoryBlock(nn.Module):
         B, T, N, d = state.shape
 
         # Intra-step mixing: non-causal self-attention among latents per step.
-        # TransformerBlock has internal residual connections.
         mixed = einops.rearrange(state, "b t n d -> (b t) n d")
         mixed = self.intra_step_mixer(q=mixed)
         state = einops.rearrange(mixed, "(b t) n d -> b t n d", b=B, t=T)

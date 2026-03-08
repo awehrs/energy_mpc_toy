@@ -34,3 +34,16 @@ memory:
 predictor:
   n_layers: 4
 
+energy:
+  continue_constant: 1.0   # step cost in soft Bellman targets (higher → prefer stopping sooner)
+completion: {}  # same
+
+policy:
+  n_layers: 4
+  time_emb_dim: 1024
+  n_integration_steps: 10
+
+plan:
+  horizon: 3
+  num_samples: 16
+

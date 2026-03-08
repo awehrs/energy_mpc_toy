@@ -14,12 +14,6 @@ from transformers import DataCollatorWithFlattening
 from pydantic.warnings import UnsupportedFieldAttributeWarning
 
 from training.trainer import AccelerateTrainer
-from training.train_action_vae import (
-    CorruptionScheduler,
-    LinearWarmupHold,
-    PackedBatchSampler,
-    SequencePackedCollator,
-)
 from dataset.action_dataset import ActionDataset
 from models.sensors import LanguageSensor
 from models.actuators import LanguageActuator
@@ -485,6 +479,16 @@ class ActuatorTrainer(AccelerateTrainer):
         )
         return self.model
 
+    def _create_optimizer(self) -> torch.optim.Optimizer:
+        trainable = [p for p in self.model.parameters() if p.requires_grad]
+        return torch.optim.AdamW(
+            trainable,
+            lr=self.config.learning_rate,
+            betas=(self.config.adam_beta1, self.config.adam_beta2),
+            eps=self.config.adam_epsilon,
+            weight_decay=self.config.weight_decay,
+        )
+
     def on_optimizer_step_end(self):
         self.optimizer.step()
         self.lr_scheduler.step()
@@ -541,15 +545,14 @@ class ActuatorTrainer(AccelerateTrainer):
         cu_seq_lens = batch["cu_seq_lens"]
         position_ids = batch["position_ids"]
 
-        with self.accelerator.autocast():
-            outputs = self.model(
-                input_ids=input_ids,
-                corrupted_ids=corrupted_ids,
-                position_ids=position_ids,
-                max_seq_len=max_seq_len,
-                cu_seq_lens=cu_seq_lens,
-                targets=targets,
-            )
+        outputs = self.model(
+            input_ids=input_ids,
+            corrupted_ids=corrupted_ids,
+            position_ids=position_ids,
+            max_seq_len=max_seq_len,
+            cu_seq_lens=cu_seq_lens,
+            targets=targets,
+        )
 
         loss = outputs["loss"]
 
@@ -558,15 +561,6 @@ class ActuatorTrainer(AccelerateTrainer):
         }
 
         return loss, metrics
-
-
-# Find config directory - handle both local and container environments
-script_dir = Path(__file__).parent
-if (script_dir / "conf").exists():
-    config_path = str(script_dir / "conf")
-else:
-    project_root = script_dir.parent
-    config_path = str(project_root / "conf")
 
 
 @hydra.main(version_base="1.1", config_path="../conf", config_name="config")
