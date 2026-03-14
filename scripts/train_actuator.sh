@@ -9,9 +9,14 @@ GCS_BUCKET=energy-mpc
 LOCAL_CACHE=/tmp/datasets
 DATASET_NAME=action_dataset
 PROJECT_NAME=energy_mpc_toy
-JEPA_CHECKPOINT_GCS=training/jepa-model/latest
+JEPA_CHECKPOINT_GCS="${1}/out/best_model"  # e.g. gs://energy-mpc/training/jepa-model/20260312_084308
 JEPA_CHECKPOINT_LOCAL=/tmp/jepa_checkpoint
 
+if [ -z "$JEPA_CHECKPOINT_GCS" ]; then
+    echo "❌ Usage: $0 <jepa_checkpoint_gcs_path>"
+    echo "   e.g.: $0 gs://energy-mpc/training/jepa-model/20260309_123456"
+    exit 1
+fi
 
 echo "🚀 Setting up actuator training on Lambda Labs..."
 
@@ -173,7 +178,7 @@ MAX_SSH_RETRIES=100
 for attempt in $(seq 1 $MAX_SSH_RETRIES); do
     echo "   SSH attempt $attempt/$MAX_SSH_RETRIES..."
 
-    if ssh -o BatchMode=yes -o StrictHostKeyChecking=accept-new -o ConnectTimeout=15 \
+    if ssh -o BatchMode=yes -o StrictHostKeyChecking=no -o ConnectTimeout=15 \
            -i $SSH_PATH ubuntu@${INSTANCE_IP} 'echo "SSH ready"' >/dev/null 2>&1; then
         echo "✅ SSH connection successful"
         SSH_READY=true
@@ -206,7 +211,7 @@ rsync -av --progress \
     --exclude='outputs' \
     --exclude='.venv' \
     --exclude='tests' \
-    -e "ssh -o BatchMode=yes -o StrictHostKeyChecking=accept-new -i ${SSH_PATH}" \
+    -e "ssh -o BatchMode=yes -o StrictHostKeyChecking=no -i ${SSH_PATH}" \
     . ubuntu@${INSTANCE_IP}:~/${PROJECT_NAME}/
 
 rm ./servicekey.json
@@ -313,8 +318,7 @@ fi
 # Download JEPA checkpoint from GCS
 echo "📥 Downloading JEPA checkpoint..."
 mkdir -p "$JEPA_CHECKPOINT_LOCAL"
-gsutil -m cp "gs://$GCS_BUCKET/${JEPA_CHECKPOINT_GCS}/*.pt" "$JEPA_CHECKPOINT_LOCAL/"
-gsutil -m cp "gs://$GCS_BUCKET/${JEPA_CHECKPOINT_GCS}/config.yaml" "$JEPA_CHECKPOINT_LOCAL/"
+gsutil -m cp -r "${JEPA_CHECKPOINT_GCS}/*" "$JEPA_CHECKPOINT_LOCAL/"
 
 if [ ! -f "$JEPA_CHECKPOINT_LOCAL/sensor_projection.pt" ]; then
     echo "❌ JEPA checkpoint missing sensor_projection.pt"
@@ -334,8 +338,11 @@ nvidia-smi
 
 cd ~/${PROJECT_NAME}
 
+PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
 uv run accelerate launch training/train_actuator.py \
-    training.dataset_name=action_dataset \
+    training=actuator \
+    training.dataset_name=${DATASET_NAME} \
+    training.cache_dir=${LOCAL_CACHE} \
     training.jepa_checkpoint=${JEPA_CHECKPOINT_LOCAL}
 
 echo "✅ Training completed!"
@@ -354,13 +361,13 @@ fi
 EOF
 
 # Copy and run the setup script
-scp -o BatchMode=yes -o StrictHostKeyChecking=accept-new -i $SSH_PATH \
+scp -o BatchMode=yes -o StrictHostKeyChecking=no -i $SSH_PATH \
     setup_and_train.sh ubuntu@${INSTANCE_IP}:~/
 
 # Clean up local setup script
 rm -f setup_and_train.sh
 
-ssh -o BatchMode=yes -o StrictHostKeyChecking=accept-new -i $SSH_PATH \
+ssh -o BatchMode=yes -o StrictHostKeyChecking=no -i $SSH_PATH \
     ubuntu@${INSTANCE_IP} \
     "chmod +x setup_and_train.sh && ./setup_and_train.sh \
     ${PROJECT_NAME} \

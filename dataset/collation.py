@@ -111,8 +111,6 @@ class BucketBatchSampler:
         self.shuffle = shuffle
         self.seed = seed
         self.drop_last = drop_last
-        self.num_replicas = int(os.environ.get("WORLD_SIZE", 1))
-        self.rank = int(os.environ.get("RANK", 0))
         self.epoch = 0
 
         if isinstance(dataset, torch.utils.data.Subset):
@@ -173,7 +171,7 @@ class BucketBatchSampler:
                 current += tc
             if current > 0:
                 total += 1
-        return total // self.num_replicas
+        return total
 
     def __iter__(self):
         g = torch.Generator()
@@ -201,7 +199,4 @@ class BucketBatchSampler:
             perm = torch.randperm(len(all_batches), generator=g).tolist()
             all_batches = [all_batches[i] for i in perm]
 
-        batches_per_replica = len(all_batches) // self.num_replicas
-        start = self.rank * batches_per_replica
-        end = start + batches_per_replica if self.rank < self.num_replicas - 1 else len(all_batches)
-        yield from all_batches[start:end]
+        yield from all_batches

@@ -5,14 +5,15 @@ from typing import Any, Callable, Dict
 
 import hydra
 import torch
-from torch.utils.data import DataLoader, Dataset
-from omegaconf import DictConfig, OmegaConf
 from accelerate import Accelerator
 from accelerate.utils import set_seed
+from omegaconf import DictConfig, OmegaConf
+from torch.utils.data import DataLoader, Dataset
+
 
 from models.agent import ToolAgent
-from models.energy import Energy, CompletionModel
 from models.policy import FlowPolicy
+from models.energy import Energy, CompletionModel
 from dataset.trajectory_dataset import TrajectoryDataset
 from dataset.collation import BucketBatchSampler, TrajectoryCollator
 
@@ -219,7 +220,7 @@ class AlternatingTrainer:
         with torch.no_grad():
             for batch in self.static_dataloader:
                 with self.accelerator.autocast():
-                    outputs = self.agent.jepa_forward(
+                    outputs = self._unwrapped_agent.jepa_forward(
                         precept_tokens=batch["precept_ids"],
                         action_tokens=batch["action_ids"],
                         precept_max_seq_len=batch["precept_max_seq_len"],
@@ -328,7 +329,9 @@ class AlternatingTrainer:
         """Linear ramp: dataset_weight 1→(1-max_policy_weight), policy_weight 0→max_policy_weight."""
         n_cycles = self.config.n_cycles
         max_pw = self.config.max_policy_weight
-        policy_weight = max_pw * (self.cycle / max(n_cycles - 1, 1)) if n_cycles > 1 else max_pw
+        policy_weight = (
+            max_pw * (self.cycle / max(n_cycles - 1, 1)) if n_cycles > 1 else max_pw
+        )
         return 1.0 - policy_weight, policy_weight
 
     def run_energy_epoch(self):
@@ -341,7 +344,9 @@ class AlternatingTrainer:
         cache = self.state_cache
         dataset_weight, policy_weight = self._policy_weights()
         n_policy_samples = self.config.n_policy_samples if policy_weight > 0.0 else 0
-        logger.info(f"[cycle {self.cycle}] dataset_weight={dataset_weight:.3f}, policy_weight={policy_weight:.3f}, n_policy_samples={n_policy_samples}")
+        logger.info(
+            f"[cycle {self.cycle}] dataset_weight={dataset_weight:.3f}, policy_weight={policy_weight:.3f}, n_policy_samples={n_policy_samples}"
+        )
 
         logging_steps = self.config.logging_steps
         running_loss, num_steps = 0.0, 0
@@ -356,8 +361,12 @@ class AlternatingTrainer:
             with self.accelerator.accumulate(self.agent):
                 with self.accelerator.autocast():
                     loss = self.agent.train_energy_model(
-                        states, next_states, has_next,
-                        dataset_weight, policy_weight, n_policy_samples,
+                        states,
+                        next_states,
+                        has_next,
+                        dataset_weight,
+                        policy_weight,
+                        n_policy_samples,
                     )
 
                 self.accelerator.backward(loss)
@@ -471,10 +480,14 @@ class AlternatingTrainer:
 
         n = min(n_samples // 2, len(cache.terminal), len(cache.nonterminal))
         term = cache.terminal[torch.randperm(len(cache.terminal))[:n]].to(device)
-        nonterm = cache.nonterminal[torch.randperm(len(cache.nonterminal))[:n]].to(device)
+        nonterm = cache.nonterminal[torch.randperm(len(cache.nonterminal))[:n]].to(
+            device
+        )
 
         states = torch.cat([term, nonterm])
-        labels = torch.cat([torch.ones(n, device=device), torch.zeros(n, device=device)])
+        labels = torch.cat(
+            [torch.ones(n, device=device), torch.zeros(n, device=device)]
+        )
 
         probs = self.agent.completion.predict(states)
         preds = (probs > 0.5).float()
@@ -499,7 +512,9 @@ class AlternatingTrainer:
         n_term = min(n_samples // 2, len(cache.terminal))
         n_nonterm = min(n_samples // 2, len(cache.nonterminal))
         term = cache.terminal[torch.randperm(len(cache.terminal))[:n_term]].to(device)
-        nonterm = cache.nonterminal[torch.randperm(len(cache.nonterminal))[:n_nonterm]].to(device)
+        nonterm = cache.nonterminal[
+            torch.randperm(len(cache.nonterminal))[:n_nonterm]
+        ].to(device)
 
         energy_term = self.agent.energy(term).mean().item()
         energy_nonterm = self.agent.energy(nonterm).mean().item()

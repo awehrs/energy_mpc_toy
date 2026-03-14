@@ -60,6 +60,7 @@ class ActionDataset(Dataset):
         datasets = cls.download_datasets(
             dataset_names=config.dataset_names,
             debug=config.debug,
+            min_overall_score=config.min_overall_score,
         )
 
         datasets = cls.conform_example_format(datasets)
@@ -112,6 +113,7 @@ class ActionDataset(Dataset):
     def download_datasets(
         dataset_names: Union[str, List[str]],
         debug: bool,
+        min_overall_score: int = 0,
     ) -> List[datasets.Dataset]:
 
         if isinstance(dataset_names, str):
@@ -136,6 +138,15 @@ class ActionDataset(Dataset):
 
                     if debug:
                         dataset = dataset.select(range(5 * 32))
+
+                    if min_overall_score > 0:
+                        dataset = dataset.filter(
+                            lambda x: x["response_quality_assessment"] != ""
+                            and json.loads(x["response_quality_assessment"]).get(
+                                "overall_score", 0
+                            )
+                            >= min_overall_score
+                        )
 
                     dataset_list.append(dataset)
             else:
@@ -218,6 +229,8 @@ class ActionDataset(Dataset):
         **kwargs,
     ) -> datasets.Dataset:
 
+        eos_id = tokenizer.eos_token_id
+
         def tokenize_fn(examples):
 
             tokenized = tokenizer(
@@ -226,7 +239,9 @@ class ActionDataset(Dataset):
                 **kwargs,
             )
 
-            examples[dst_columns["tokens"]] = tokenized["input_ids"]
+            examples[dst_columns["tokens"]] = [
+                ids + [eos_id] for ids in tokenized["input_ids"]
+            ]
 
             if "mask" in dst_columns:
                 examples[dst_columns["mask"]] = tokenized["attention_mask"]
@@ -331,15 +346,22 @@ class ActionDataset(Dataset):
 
         num_nulls = int(null_ratio * len(dataset))
 
-        num_tokens = max_len if pad else 2  # [PAD, EOS]
+        # Null sequence: [null_token_id, eos_token_id] matches how "~" is tokenized
+        # in TrajectoryDataset (add_special_tokens=True + appended eos).
+        # When padding, fill to max_len with null_token_id before the eos.
+        if pad:
+            null_tokens = (max_len - 2) * [null_token_id] + [null_token_id, eos_token_id]
+            null_len = max_len
+        else:
+            null_tokens = [null_token_id, eos_token_id]
+            null_len = 2
 
         null_data = {
             "id": [""] * num_nulls,
             "actions": [""] * num_nulls,
-            "action_tokens": [(num_tokens - 2) * [null_token_id] + [eos_token_id]]
-            * num_nulls,
-            "attention_mask": [[1] * num_tokens] * num_nulls,
-            "token_length": [num_tokens] * num_nulls,
+            "action_tokens": [null_tokens] * num_nulls,
+            "attention_mask": [[1] * null_len] * num_nulls,
+            "token_length": [null_len] * num_nulls,
         }
 
         if "attention_mask" not in dataset.features:

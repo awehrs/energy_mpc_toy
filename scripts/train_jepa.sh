@@ -2,7 +2,7 @@
 source .env
 
 # Configuration
-INSTANCE_TYPE=gpu_1x_h100_pcie #gpu_8x_a100_80gb_sxm4
+INSTANCE_TYPE=gpu_8x_a100_80gb_sxm4 #gpu_1x_h100_pcie
 SSH_NAME=scoobdoob
 SSH_PATH=~/.ssh/scoobdoob.pem
 GCS_BUCKET=energy-mpc

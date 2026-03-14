@@ -1,0 +1,10 @@
+defaults:
+  - default
+
+# ================================
+# Actuator-Specific Overrides
+# ================================
+
+torch_compile: false  # nn.RMSNorm F32/BF16 mismatch causes inductor errors under compile
+max_tokens_per_batch: 16384
+wandb_project: "actuator-training"

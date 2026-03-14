@@ -1,14 +1,14 @@
 # Basic Training Parameters
 name: default
 seed: 42
-num_epochs: 1
+num_epochs: 5
 max_steps: -1  
 per_device_train_batch_size: 32
 per_device_eval_batch_size: 64
-gradient_accumulation_steps: 8
+gradient_accumulation_steps: 1
 train_ratio: .9
 show_stats: true
-max_tokens_per_batch: 32000
+max_tokens_per_batch: 65536 #32000
 even_batches: false 
 action_bucket: "data"
 dataset_name: "action_dataset"
@@ -17,7 +17,7 @@ cache_dir: "/tmp/datasets"
 # Learning Rate & Optimization
 learning_rate: 3e-4
 lr_scheduler_type: "cosine"  # "linear", "cosine", "constant"
-warmup_steps: 100
+warmup_steps: 40
 adam_beta1: 0.9
 adam_beta2: 0.95
 adam_epsilon: 1e-8

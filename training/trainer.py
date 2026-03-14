@@ -8,10 +8,10 @@ from typing import Any, Callable, Dict, Optional
 import torch
 import torch._dynamo
 import torch.nn as nn
-from torch.utils.data import DataLoader, Dataset
 from omegaconf import DictConfig
 from accelerate import Accelerator
 from accelerate.utils import set_seed
+from torch.utils.data import DataLoader, Dataset
 
 torch.set_float32_matmul_precision("high")
 
@@ -162,37 +162,49 @@ class AccelerateTrainer:
                 batch_sampler=eval_batch_sampler,
             )
 
-        # Calculate total training steps
+        # Prepare model, optimizer, and dataloaders first so we can get the
+        # true per-process batch count from the prepared dataloader.
         if config.max_steps > 0:
             self.total_steps = config.max_steps
-        else:
-            if train_batch_sampler is not None:
-                num_batches = len(train_batch_sampler)
-                steps_per_epoch = num_batches // config.gradient_accumulation_steps
-                self.total_steps = steps_per_epoch * config.num_epochs
-            else:
-                total_batches = len(self.train_dataset) // (
-                    config.per_device_train_batch_size * self.accelerator.num_processes
-                )
-                steps_per_epoch = total_batches // config.gradient_accumulation_steps
-                self.total_steps = steps_per_epoch * config.num_epochs
-
-            # Initialize learning rate scheduler
             self.lr_scheduler = self._create_lr_scheduler(self.total_steps)
-
-        (
-            self.model,
-            self.optimizer,
-            train_dataloader,
-            eval_dataloader,
-            self.lr_scheduler,
-        ) = self.accelerator.prepare(
-            self.model,
-            self.optimizer,
-            train_dataloader,
-            eval_dataloader,
-            self.lr_scheduler,
-        )
+            (
+                self.model,
+                self.optimizer,
+                train_dataloader,
+                eval_dataloader,
+                self.lr_scheduler,
+            ) = self.accelerator.prepare(
+                self.model,
+                self.optimizer,
+                train_dataloader,
+                eval_dataloader,
+                self.lr_scheduler,
+            )
+        else:
+            (
+                self.model,
+                self.optimizer,
+                train_dataloader,
+                eval_dataloader,
+            ) = self.accelerator.prepare(
+                self.model,
+                self.optimizer,
+                train_dataloader,
+                eval_dataloader,
+            )
+            # Compute total_steps from the actual prepared dataloader length,
+            # which correctly reflects DDP sharding done by BatchSamplerShard.
+            steps_per_epoch = (
+                len(train_dataloader) // config.gradient_accumulation_steps
+            )
+            self.total_steps = steps_per_epoch * config.num_epochs
+            self.accelerator.print(
+                f"total_steps={self.total_steps} "
+                f"(steps_per_epoch={steps_per_epoch}, num_epochs={config.num_epochs}, "
+                f"grad_accum={config.gradient_accumulation_steps})"
+            )
+            self.lr_scheduler = self._create_lr_scheduler(self.total_steps)
+            self.lr_scheduler = self.accelerator.prepare(self.lr_scheduler)
 
         self.train_dataloader = train_dataloader
         self.eval_dataloader = eval_dataloader
@@ -221,6 +233,13 @@ class AccelerateTrainer:
         self.epoch = 0
         self.best_eval_loss = float("inf")
 
+        # Scale step-based config values by num_processes so yaml values are
+        # "single-GPU equivalents" and the trainer adjusts for multi-GPU runs.
+        n = self.accelerator.num_processes
+        self.logging_steps = max(1, config.logging_steps // n)
+        self.eval_steps = max(1, config.eval_steps // n)
+        self.save_steps = max(1, config.save_steps // n)
+
         # Create output directory
         if self.accelerator.is_main_process:
             Path(config.output_dir).mkdir(parents=True, exist_ok=True)
@@ -242,29 +261,40 @@ class AccelerateTrainer:
         )
 
     def _create_lr_scheduler(self, num_training_steps: int):
-        """Create learning rate scheduler."""
+        """Create learning rate scheduler.
+
+        AcceleratedScheduler (returned by accelerator.prepare) calls the
+        underlying scheduler .step() num_processes times per call when
+        split_batches=False (the default). Multiply both warmup and training
+        steps by num_processes so the schedule completes at the right wall-clock
+        optimizer step count.
+        """
+        n = self.accelerator.num_processes
+        warmup = self.config.warmup_steps * n
+        total = num_training_steps * n
+
         if self.config.lr_scheduler_type == "linear":
             from transformers import get_linear_schedule_with_warmup
 
             return get_linear_schedule_with_warmup(
                 self.optimizer,
-                num_warmup_steps=self.config.warmup_steps,
-                num_training_steps=num_training_steps,
+                num_warmup_steps=warmup,
+                num_training_steps=total,
             )
         elif self.config.lr_scheduler_type == "cosine":
             from transformers import get_cosine_schedule_with_warmup
 
             return get_cosine_schedule_with_warmup(
                 self.optimizer,
-                num_warmup_steps=self.config.warmup_steps,
-                num_training_steps=num_training_steps,
+                num_warmup_steps=warmup,
+                num_training_steps=total,
             )
         else:  # constant
             from transformers import get_constant_schedule_with_warmup
 
             return get_constant_schedule_with_warmup(
                 self.optimizer,
-                num_warmup_steps=self.config.warmup_steps,
+                num_warmup_steps=warmup,
             )
 
     def _default_eval_fn(self, eval_dataloader: DataLoader):
@@ -524,49 +554,46 @@ class AccelerateTrainer:
                 if hasattr(sampler, "set_epoch"):
                     sampler.set_epoch(epoch)
 
-            logger.info(f"[epoch {epoch}] Starting dataloader iteration...")
             for batch_idx, batch in enumerate(self.train_dataloader):
-                logger.info(f"[step {self.global_step}] Got batch {batch_idx}")
                 with self.accelerator.accumulate(self.model):
                     loss, additional_metrics, grad_norm = self.train_micro_step(
                         batch=batch,
                         timer=timer,
                     )
-                logger.info(f"[step {self.global_step}] Micro-step done")
 
-                # Accumulate loss (only log on accumulation boundary)
-                total_loss += loss.detach()
+                    # Accumulate loss (only log on accumulation boundary)
+                    total_loss += loss.detach()
 
-                # Only log/save on accumulation boundaries
-                if self.accelerator.sync_gradients:
-                    self.on_optimizer_step_end()
+                    # Only log/save on accumulation boundaries
+                    if self.accelerator.sync_gradients:
+                        self.on_optimizer_step_end()
 
-                    self.on_step_end(
-                        epoch=epoch,
-                        loss=loss,
-                        total_loss=total_loss,
-                        additional_metrics=additional_metrics,
-                        grad_norm=grad_norm,
-                        timer=timer,
-                        start_time=start_time,
-                    )
+                        self.on_step_end(
+                            epoch=epoch,
+                            loss=loss,
+                            total_loss=total_loss,
+                            additional_metrics=additional_metrics,
+                            grad_norm=grad_norm,
+                            timer=timer,
+                            start_time=start_time,
+                        )
 
-                    # Update local timing anchor if logging happened inside on_step_end
-                    start_time = (
-                        self._step_end_start_time
-                        if hasattr(self, "_step_end_start_time")
-                        else start_time
-                    )
+                        # Update local timing anchor if logging happened inside on_step_end
+                        start_time = (
+                            self._step_end_start_time
+                            if hasattr(self, "_step_end_start_time")
+                            else start_time
+                        )
 
-                    total_loss = 0
-                    self.global_step += 1
+                        total_loss = 0
+                        self.global_step += 1
 
-                    # Check if we've reached max steps
-                    if (
-                        self.config.max_steps > 0
-                        and self.global_step >= self.config.max_steps
-                    ):
-                        break
+                        # Check if we've reached max steps
+                        if (
+                            self.config.max_steps > 0
+                            and self.global_step >= self.config.max_steps
+                        ):
+                            break
 
             if self.config.max_steps > 0 and self.global_step >= self.config.max_steps:
                 break
@@ -592,18 +619,12 @@ class AccelerateTrainer:
         # Forward pass
         with self.accelerator.autocast():
             fwd_start = time.time()
-            logger.info(f"[step {self.global_step}] Forward start")
             loss, additional_metrics = self._compute_loss(batch)
-            torch.cuda.synchronize()
-            logger.info(f"[step {self.global_step}] Forward done ({time.time() - fwd_start:.1f}s)")
             timer.update_fwd(time.time() - fwd_start)
 
         # Backward pass
         bwd_start = time.time()
-        logger.info(f"[step {self.global_step}] Backward start")
         self.accelerator.backward(loss)
-        torch.cuda.synchronize()
-        logger.info(f"[step {self.global_step}] Backward done ({time.time() - bwd_start:.1f}s)")
         timer.update_bwd(time.time() - bwd_start)
 
         # Gradient clipping
@@ -618,11 +639,9 @@ class AccelerateTrainer:
 
     def on_optimizer_step_end(self):
         """Runs optimizer/scheduler update exactly once per true step."""
-        logger.info(f"[step {self.global_step}] Optimizer step start")
         self.optimizer.step()
         self.lr_scheduler.step()
         self.optimizer.zero_grad()
-        logger.info(f"[step {self.global_step}] Optimizer step done")
 
     def on_step_end(
         self,
@@ -636,7 +655,7 @@ class AccelerateTrainer:
     ):
         """Runs logging/eval/save decisions at true step boundaries."""
         # Logging
-        if self.global_step % self.config.logging_steps == 0:
+        if self.global_step % self.logging_steps == 0:
 
             allocated = torch.cuda.memory_allocated() / 1e9
             max_allocated = torch.cuda.max_memory_allocated() / 1e9
@@ -647,7 +666,7 @@ class AccelerateTrainer:
 
             current_time = time.time()
             elapsed = current_time - start_time
-            steps_per_sec = self.config.logging_steps / elapsed if elapsed > 0 else 0
+            steps_per_sec = self.logging_steps / elapsed if elapsed > 0 else 0
 
             # Average loss over accumulation steps
             avg_loss = total_loss / self.config.gradient_accumulation_steps
@@ -684,9 +703,9 @@ class AccelerateTrainer:
             self.eval_dataloader is not None
             and self.global_step > 0
             and self.config.eval_steps > 0
-            and self.global_step % self.config.eval_steps == 0
+            and self.global_step % self.eval_steps == 0
         ):
-            logging.info("Beginning evaluation...")
+            self.accelerator.print("Beginning evaluation...")
 
             eval_metrics = self.eval_fn(self.eval_dataloader)
             eval_metrics = {
@@ -704,5 +723,5 @@ class AccelerateTrainer:
             self.model.train()
 
         # Save checkpoint
-        if self.global_step > 0 and self.global_step % self.config.save_steps == 0:
+        if self.global_step > 0 and self.global_step % self.save_steps == 0:
             self.save_checkpoint(self.global_step)

@@ -149,7 +149,9 @@ class JepaTrainer(AccelerateTrainer):
         n_state = jepa_model.precept_downsampler.query.shape[0]
         n_action = jepa_model.action_downsampler.query.shape[0]
         device = self.accelerator.device
-        predictor = self.model.predictor  # compiled version
+        predictor = (
+            jepa_model.predictor
+        )  # compiled version (self.model is DDP-wrapped here)
         self.max_traj_len = max_traj_len
         with torch.no_grad(), self.accelerator.autocast():
             for T in range(2, max_traj_len + 1):
@@ -232,15 +234,17 @@ class JepaTrainer(AccelerateTrainer):
                     targets=targets,
                 )
 
+                model = self._unwrapped_model
+
                 # Normal eval
                 with self.accelerator.autocast():
-                    outputs = self.model.jepa_forward(**fwd_kwargs)
+                    outputs = model.jepa_forward(**fwd_kwargs)
                 total_loss += outputs["loss"].item()
 
                 # Ablation: zero out action tokens
                 with self.accelerator.autocast():
                     fwd_kwargs["action_tokens"] = torch.zeros_like(batch["action_ids"])
-                    out_no_action = self.model.jepa_forward(**fwd_kwargs)
+                    out_no_action = model.jepa_forward(**fwd_kwargs)
                 total_loss_no_action += out_no_action["loss"].item()
 
                 # Ablation: zero out precept tokens (restore action)
@@ -249,7 +253,7 @@ class JepaTrainer(AccelerateTrainer):
                     fwd_kwargs["precept_tokens"] = torch.zeros_like(
                         batch["precept_ids"]
                     )
-                    out_no_state = self.model.jepa_forward(**fwd_kwargs)
+                    out_no_state = model.jepa_forward(**fwd_kwargs)
                 total_loss_no_state += out_no_state["loss"].item()
 
                 for k, v in outputs.items():
@@ -273,22 +277,13 @@ class JepaTrainer(AccelerateTrainer):
 
     def on_optimizer_step_end(self):
         super().on_optimizer_step_end()
-        logger.info(f"[step {self.global_step}] EMA update start")
         model = self._unwrapped_model
         self.ema_encoder.update(model.sensor, model.precept_downsampler)
-        logger.info(f"[step {self.global_step}] EMA update done")
 
     def _compute_loss(self, batch: Dict[str, torch.Tensor]) -> torch.Tensor:
         bsz = len(batch["cu_traj_lens"]) - 1
-        logger.info(
-            f"[step {self.global_step}] _compute_loss: bsz={bsz}, "
-            f"precept_tokens={batch['precept_ids'].shape}, "
-            f"action_tokens={batch['action_ids'].shape}, "
-            f"max_traj_len={batch['max_traj_len']}"
-        )
 
         # 1. EMA forward → targets [B, T, Np, d]
-        t0 = time.time()
         targets = self.ema_encoder(
             precept_tokens=batch["precept_ids"],
             precept_position_ids=batch["precept_position_ids"],
@@ -298,9 +293,6 @@ class JepaTrainer(AccelerateTrainer):
             bsz=bsz,
             max_traj_len=batch["max_traj_len"],
         )
-        torch.cuda.synchronize()
-        logger.info(f"  EMA forward: {time.time() - t0:.2f}s")
-
         # Overwrite EMA target at the terminal (STOP) step with s_terminal.
         # Each trajectory's last valid step should predict the constant terminal state.
         s_terminal = self._unwrapped_model.s_terminal  # [Np, d]
@@ -310,8 +302,7 @@ class JepaTrainer(AccelerateTrainer):
             targets[i, last_step] = s_terminal.detach()
 
         # 2. Student forward (loss computed inside jepa_forward)
-        t0 = time.time()
-        outputs = self.model.jepa_forward(
+        outputs = self._unwrapped_model.jepa_forward(
             precept_tokens=batch["precept_ids"],
             action_tokens=batch["action_ids"],
             precept_max_seq_len=batch["precept_max_seq_len"],
@@ -325,9 +316,6 @@ class JepaTrainer(AccelerateTrainer):
             traj_mask=batch["traj_mask"],
             targets=targets,
         )
-        torch.cuda.synchronize()
-        logger.info(f"  Student forward: {time.time() - t0:.2f}s")
-
         # Diagnostics
         with torch.no_grad():
             # Effective rank of target representations
@@ -375,34 +363,6 @@ def main(cfg: DictConfig) -> None:
 
     OmegaConf.register_new_resolver("eval", eval)
     OmegaConf.resolve(cfg)
-
-    # dataset = TrajectoryDataset.build_dataset(cfg.dataset)
-
-    # eval_size = 1
-    # train_size = len(dataset) - eval_size
-
-    # generator = torch.Generator().manual_seed(cfg.training.seed)
-
-    # train_dataset, eval_dataset = torch.utils.data.random_split(
-    #     dataset,
-    #     lengths=[train_size, eval_size],
-    #     generator=generator,
-    # )
-
-    # train_batch_sampler = BucketBatchSampler(
-    #     train_dataset,
-    #     max_tokens=cfg.training.max_tokens_per_batch,
-    # )
-
-    # dl = torch.utils.data.DataLoader(
-    #     dataset,
-    #     collate_fn=TrajectoryCollator(pad_token_id=dataset.tokenizer.pad_token_id),
-    #     batch_size=4,
-    # )
-
-    # batch = next(iter(dl))
-
-    # assert False
 
     dataset = TrajectoryDataset.load(
         src_dir=Path(

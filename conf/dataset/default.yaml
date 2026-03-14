@@ -4,6 +4,7 @@ max_precept_len: ${max_precept_len}
 null_symbol: ${null_symbol}
 stop_symbol: ${stop_symbol}
 null_ratio: .02
+min_overall_score: 4
 pad: false
 dataset_dir: data/dataset
 debug: false

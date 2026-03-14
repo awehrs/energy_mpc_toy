@@ -262,8 +262,6 @@ class PackedBatchSampler:
         self.max_tokens = max_tokens
         self.shuffle = shuffle
         self.seed = seed
-        self.num_replicas = int(os.environ.get("WORLD_SIZE", 1))
-        self.rank = int(os.environ.get("RANK", 0))
         self.epoch = 0
 
         # Handle Subset vs regular dataset
@@ -303,11 +301,11 @@ class PackedBatchSampler:
         if current_tokens > 0:
             num_batches += 1
 
-        return num_batches // self.num_replicas
+        return num_batches
 
     def __len__(self):
         return self.batch_counts_per_epoch.get(
-            self.epoch, sum(self.seq_lengths) // self.max_tokens // self.num_replicas
+            self.epoch, sum(self.seq_lengths) // self.max_tokens
         )
 
     def get_total_steps(self):
@@ -348,14 +346,8 @@ class PackedBatchSampler:
         if current_batch:
             all_batches.append(current_batch)
 
-        # Split batches across GPUs
-        batches_per_replica = len(all_batches) // self.num_replicas
-        start_idx = self.rank * batches_per_replica
-        end_idx = (
-            start_idx + batches_per_replica
-            if self.rank < self.num_replicas - 1
-            else len(all_batches)
-        )
+        start_idx = 0
+        end_idx = len(all_batches)
 
         # Yield batches, mapping back to original indices if needed
         for batch in all_batches[start_idx:end_idx]:
@@ -469,14 +461,9 @@ class ActuatorTrainer(AccelerateTrainer):
         self.corruption_scheduler = corruption_scheduler
 
     def _compile(self):
-        self.model.actuator.self_attention_layers = torch.compile(
-            self.model.actuator.self_attention_layers,
-            mode=self.config.torch_compile_mode,
-        )
-        self.model.actuator.projection = torch.compile(
-            self.model.actuator.projection,
-            mode=self.config.torch_compile_mode,
-        )
+        # torch.compile causes inductor dtype errors (Float vs BFloat16) in
+        # TransformerBlock due to nn.RMSNorm F32 output. Actuator training has
+        # no GDN triton recompilation issue, so compile is not needed here.
         return self.model
 
     def _create_optimizer(self) -> torch.optim.Optimizer:
@@ -640,7 +627,7 @@ def main(cfg: DictConfig) -> None:
         config=cfg,
         encoder=frozen_encoder,
         actuator=actuator,
-    )
+    ).to(dtype=torch.bfloat16)
 
     # --- Collation ---
 
